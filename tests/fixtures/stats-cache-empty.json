@@ -1,0 +1,13 @@
+{
+  "version": 3,
+  "lastComputedDate": null,
+  "dailyActivity": [],
+  "dailyModelTokens": [],
+  "modelUsage": {},
+  "totalSessions": 0,
+  "totalMessages": 0,
+  "longestSession": null,
+  "firstSessionDate": null,
+  "hourCounts": {},
+  "totalSpeculationTimeSavedMs": 0
+}

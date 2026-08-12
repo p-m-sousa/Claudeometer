@@ -1,0 +1,112 @@
+name: Windows build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Select artifact version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $version = "0.1.0-ci.$env:GITHUB_RUN_NUMBER"
+          }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore src/ClaudeUsage.WinForms/ClaudeUsage.WinForms.csproj
+
+      - name: Build
+        shell: pwsh
+        run: dotnet build src/ClaudeUsage.WinForms/ClaudeUsage.WinForms.csproj --configuration Release --no-restore -p:Version=${{ steps.version.outputs.value }}
+
+      - name: Verify no-elevation manifest
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath 'src/ClaudeUsage.WinForms/app.manifest' -Raw
+          if ($manifest -notmatch 'requestedExecutionLevel\s+level="asInvoker"') {
+            throw 'The executable manifest must request asInvoker.'
+          }
+          if ($manifest -match 'requireAdministrator|highestAvailable') {
+            throw 'The executable manifest contains an elevation level.'
+          }
+
+      - name: Verify installer is user-scoped
+        shell: pwsh
+        run: |
+          $installer = Get-Content -LiteralPath 'packaging/install.cmd' -Raw
+          if ($installer -notmatch '%LOCALAPPDATA%\\Programs\\') {
+            throw 'The installer destination is not under LOCALAPPDATA.'
+          }
+          if ($installer -match 'HKLM|runas') {
+            throw 'The installer contains a machine-wide or elevation marker.'
+          }
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $testProjects = @(Get-ChildItem -Path tests -Filter '*.csproj' -File -Recurse -ErrorAction SilentlyContinue)
+          if ($testProjects.Count -eq 0) {
+            Write-Host 'No test projects found; skipping dotnet test.'
+          }
+          foreach ($testProject in $testProjects) {
+            $projectXml = Get-Content -LiteralPath $testProject.FullName -Raw
+            if ($projectXml -match '<IsTestProject>true</IsTestProject>') {
+              dotnet test $testProject.FullName --configuration Release
+            } elseif ($projectXml -match '<OutputType>Exe</OutputType>') {
+              dotnet run --project $testProject.FullName --configuration Release
+            } else {
+              Write-Host "Skipping non-test project $($testProject.FullName)"
+              continue
+            }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Run application self-test
+        shell: pwsh
+        run: |
+          $exe = 'src/ClaudeUsage.WinForms/bin/Release/net48/ClaudeUsage.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Expected executable not found: $exe"
+          }
+          & $exe --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Application self-test failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Package portable release
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -NoBuild -Version '${{ steps.version.outputs.value }}'
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeUsage-${{ steps.version.outputs.value }}-win-anycpu
+          path: |
+            artifacts/*.zip
+            artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 30
