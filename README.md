@@ -1,6 +1,6 @@
-# Claude Usage
+# Claudeometer
 
-Claude Usage is a small, unofficial Windows 11 viewer for the local activity data that Claude Code writes under `~/.claude`. It combines historical aggregates from `stats-cache.json` with a read-only scan of current-day usage metadata in direct project transcripts and their `subagents/agent-*.jsonl` files. It works offline and can be installed for one Windows user without administrator rights.
+Claudeometer is a small, unofficial Windows 11 viewer for the local activity data that Claude Code writes under `~/.claude`. It combines historical aggregates from `stats-cache.json` with a read-only scan of current-day usage metadata in direct project transcripts and their `subagents/agent-*.jsonl` files. It works offline and can be installed for one Windows user without administrator rights.
 
 It presents date and model filters over the dimensions that Claude's local data actually contains. In current stats-cache format v5, daily model totals include input, output, cache-creation, and cache-read tokens. Older cache versions may contain input plus output only, and the app labels that distinction. These local figures are not an authoritative billing report and do not expose remaining Claude plan, session, or weekly limits.
 
@@ -35,7 +35,7 @@ Unsigned local builds may trigger Windows SmartScreen. Production downloads shou
 
 ## Privacy
 
-Claude Usage reads the selected stats cache and the in-scope Claude Code transcript files locally and does not transmit them. The current-day scanner retains only aggregate dates, model identifiers, token counters, session/message counts, and tool-call counts. It does not retain or display prompt text, assistant text, thinking, tool arguments/results, project paths, session identifiers, or credentials. Source files are opened read-only and are never modified. Its small per-user preference files store only the selected cache path and automatic-refresh interval; no usage values or transcript content are logged.
+Claudeometer reads the selected stats cache and the in-scope Claude Code transcript files locally and does not transmit them. The current-day scanner retains only aggregate dates, model identifiers, token counters, session/message counts, and tool-call counts. It does not retain or display prompt text, assistant text, thinking, tool arguments/results, project paths, session identifiers, or credentials. Source files are opened read-only and are never modified. Its small per-user preference files store only the selected cache path and automatic-refresh interval; no usage values or transcript content are logged.
 
 ## License
 
