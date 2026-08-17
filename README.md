@@ -88,7 +88,7 @@ With a .NET 8 SDK or newer:
 ```powershell
 dotnet build src/ClaudeUsage.WinForms/ClaudeUsage.WinForms.csproj --configuration Release
 dotnet run --project tests/ClaudeUsage.Core.Tests/ClaudeUsage.Core.Tests.csproj --configuration Release
-./scripts/package-release.ps1 -NoBuild -Version 0.2.0
+./scripts/package-release.ps1 -NoBuild -Version 0.2.1
 ```
 
 `ClaudeUsage.exe --self-test` exercises the shipped binary end to end: scan, archive durability,
