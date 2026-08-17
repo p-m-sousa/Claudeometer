@@ -159,6 +159,13 @@ messages 2, sessions 1.
 - [ ] Clearing *Keep watching from the notification area* in **Data sources…** makes minimise and close
       behave like a normal window even with alerts on.
 - [ ] The threshold accepts values up to 100,000,000,000 and rejects negatives.
+- [ ] **The alerts dialog shows its whole content, including Save and Cancel, with no clipped bottom
+      edge.** Check at 100%, 150%, and 200% display scaling, and with Windows' "Make text bigger"
+      raised — the explanatory text reflows, and the dialog must grow to match it.
+- [ ] Changing the threshold or the metric does not make the dialog's text outgrow the window.
+- [ ] The dialog can be resized, and shrinking it produces a vertical scrollbar rather than
+      unreachable controls.
+- [ ] On a short screen (or with the taskbar enlarged) the dialog still opens fully on screen.
 
 ## Archive durability
 

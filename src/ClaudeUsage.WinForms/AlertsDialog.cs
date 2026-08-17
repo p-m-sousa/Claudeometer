@@ -15,6 +15,7 @@ namespace ClaudeUsage.WinForms
         private readonly RadioButton _processed;
         private readonly RadioButton _inputOutput;
         private readonly Label _preview;
+        private readonly TableLayoutPanel _layout;
 
         internal AlertsDialog(AlertSettings current)
         {
@@ -22,21 +23,24 @@ namespace ClaudeUsage.WinForms
             Result = settings;
 
             Text = "Daily usage alerts";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
+            // Sizable rather than fixed: the explanatory text reflows with the display's text scale,
+            // so the window has to be able to follow it, and the user has to be able to override.
+            FormBorderStyle = FormBorderStyle.Sizable;
             MinimizeBox = false;
             MaximizeBox = false;
             ShowInTaskbar = false;
+            ShowIcon = false;
             StartPosition = FormStartPosition.CenterParent;
             BackColor = MainForm.Palette.Window;
             Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
             AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(560, 350);
-            AutoSize = true;
-            AutoSizeMode = AutoSizeMode.GrowOnly;
+            ClientSize = new Size(560, 380);
 
             var layout = new TableLayoutPanel
             {
-                Dock = DockStyle.Fill,
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 ColumnCount = 2,
                 RowCount = 7,
                 Padding = new Padding(16, 14, 16, 12),
@@ -49,7 +53,18 @@ namespace ClaudeUsage.WinForms
                 layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             }
 
-            Controls.Add(layout);
+            _layout = layout;
+
+            // The scrolling host is the safety net: if the content still cannot fit, every control
+            // stays reachable instead of being clipped off the bottom edge.
+            var scroll = new Panel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                BackColor = MainForm.Palette.Window
+            };
+            scroll.Controls.Add(layout);
+            Controls.Add(scroll);
 
             _enabled = new CheckBox
             {
@@ -133,6 +148,9 @@ namespace ClaudeUsage.WinForms
             {
                 AutoSize = true,
                 MaximumSize = new Size(500, 0),
+                // Reserve room for the longest wording this label takes, so editing a value does
+                // not make the dialog's content taller than the dialog.
+                MinimumSize = new Size(500, 52),
                 ForeColor = MainForm.Palette.Muted,
                 BackColor = MainForm.Palette.InfoBackground,
                 Padding = new Padding(10, 8, 10, 8),
@@ -181,6 +199,44 @@ namespace ClaudeUsage.WinForms
 
         /// <summary>The edited settings. Only meaningful when the dialog returns OK.</summary>
         internal AlertSettings Result { get; private set; }
+
+        /// <summary>
+        /// Sizes the dialog once its content has actually been laid out. The preview and guidance
+        /// text are only filled in at the end of construction, and both reflow with the display's
+        /// text scale, so any size chosen up front is a guess that clips the buttons when wrong.
+        /// </summary>
+        protected override void OnLoad(EventArgs args)
+        {
+            base.OnLoad(args);
+            try
+            {
+                _layout.PerformLayout();
+                var preferred = _layout.PreferredSize;
+                var workingArea = Screen.FromControl(this).WorkingArea;
+                var width = Math.Min(
+                    Math.Max(preferred.Width, ClientSize.Width),
+                    Math.Max(360, workingArea.Width - 80));
+                // A few pixels of slack: landing exactly on the content height risks a scrollbar
+                // appearing from a one-pixel rounding difference, which then steals width.
+                var height = Math.Min(preferred.Height + 4, Math.Max(240, workingArea.Height - 120));
+                if (height < preferred.Height + 4)
+                {
+                    width = Math.Min(width + SystemInformation.VerticalScrollBarWidth, workingArea.Width - 80);
+                }
+
+                ClientSize = new Size(width, height);
+                // Never narrower than the content needs, which would force a pointless horizontal
+                // scrollbar; shorter is fine because the host scrolls vertically.
+                MinimumSize = new Size(
+                    Width,
+                    Math.Min(ClientSize.Height, 260) + (Height - ClientSize.Height));
+                CenterToParent();
+            }
+            catch
+            {
+                // Never block the dialog on a measurement problem; the host panel still scrolls.
+            }
+        }
 
         private void UpdateEnabledState()
         {
