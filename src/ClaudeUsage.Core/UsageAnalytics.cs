@@ -6,6 +6,7 @@ using ClaudeUsage.Core.Internal;
 
 namespace ClaudeUsage.Core
 {
+    /// <summary>An inclusive date range and an optional model subset.</summary>
     public sealed class UsageFilter
     {
         public UsageFilter()
@@ -19,17 +20,17 @@ namespace ClaudeUsage.Core
             ToDate = DateKey.ValidateBound(toDate, nameof(toDate));
             if (FromDate != null && ToDate != null && string.CompareOrdinal(FromDate, ToDate) > 0)
             {
-                throw new ArgumentException("fromDate cannot be after toDate.", nameof(fromDate));
+                throw new ArgumentException("The From date cannot be after the To date.", nameof(fromDate));
             }
 
-            var normalizedModels = modelIds == null
+            var models = modelIds == null
                 ? new List<string>()
                 : modelIds
                     .Where(value => !string.IsNullOrWhiteSpace(value))
                     .Distinct(StringComparer.Ordinal)
                     .OrderBy(value => value, StringComparer.Ordinal)
                     .ToList();
-            ModelIds = new ReadOnlyCollection<string>(normalizedModels);
+            ModelIds = new ReadOnlyCollection<string>(models);
         }
 
         public string FromDate { get; }
@@ -38,88 +39,123 @@ namespace ClaudeUsage.Core
 
         public IReadOnlyList<string> ModelIds { get; }
 
-        public bool IncludesAllModels => ModelIds.Count == 0;
+        public bool IncludesAllModels
+        {
+            get { return ModelIds.Count == 0; }
+        }
     }
 
     public sealed class DailyUsage
     {
         internal DailyUsage(
             string date,
-            long tokens,
+            TokenTotals tokens,
+            long responseCount,
+            long toolCallCount,
             long messageCount,
-            long sessionCount,
-            long toolCallCount)
+            long sessionCount)
         {
             Date = date;
             Tokens = tokens;
+            ResponseCount = responseCount;
+            ToolCallCount = toolCallCount;
             MessageCount = messageCount;
             SessionCount = sessionCount;
-            ToolCallCount = toolCallCount;
         }
 
         public string Date { get; }
 
-        public long Tokens { get; }
+        public TokenTotals Tokens { get; }
 
-        public long MessageCount { get; }
-
-        public long SessionCount { get; }
+        public long ResponseCount { get; }
 
         public long ToolCallCount { get; }
+
+        /// <summary>Whole-day message count, across every model.</summary>
+        public long MessageCount { get; }
+
+        /// <summary>Sessions that began on this date, across every model.</summary>
+        public long SessionCount { get; }
+
+        public bool IsEmpty
+        {
+            get { return Tokens.IsEmpty && ResponseCount == 0 && MessageCount == 0 && SessionCount == 0; }
+        }
     }
 
-    public sealed class ModelTokenTotal
+    public sealed class ModelTotal
     {
-        internal ModelTokenTotal(string modelId, long tokens)
+        internal ModelTotal(
+            string modelId,
+            TokenTotals tokens,
+            long responseCount,
+            long toolCallCount,
+            long webSearchRequests)
         {
             ModelId = modelId;
             Tokens = tokens;
+            ResponseCount = responseCount;
+            ToolCallCount = toolCallCount;
+            WebSearchRequests = webSearchRequests;
         }
 
         public string ModelId { get; }
 
-        public long Tokens { get; }
+        public TokenTotals Tokens { get; }
+
+        public long ResponseCount { get; }
+
+        public long ToolCallCount { get; }
+
+        public long WebSearchRequests { get; }
     }
 
     public sealed class UsageAnalytics
     {
         internal UsageAnalytics(
-            IList<DailyUsage> dailyUsage,
-            IList<ModelTokenTotal> modelTotals,
-            long totalTokens,
+            IList<DailyUsage> days,
+            IList<ModelTotal> models,
+            TokenTotals tokens,
+            long totalResponses,
+            long totalToolCalls,
             long totalMessages,
             long totalSessions,
-            long totalToolCalls,
-            int activeDays,
             IList<string> availableModels,
             IList<string> selectedModels,
+            bool includesAllModels,
             string fromDate,
             string toDate)
         {
-            DailyUsage = new ReadOnlyCollection<DailyUsage>(dailyUsage.ToList());
-            ModelTotals = new ReadOnlyCollection<ModelTokenTotal>(modelTotals.ToList());
-            TotalTokens = totalTokens;
+            IncludesAllModels = includesAllModels;
+            Days = new ReadOnlyCollection<DailyUsage>(days.ToList());
+            Models = new ReadOnlyCollection<ModelTotal>(models.ToList());
+            Tokens = tokens;
+            TotalResponses = totalResponses;
+            TotalToolCalls = totalToolCalls;
             TotalMessages = totalMessages;
             TotalSessions = totalSessions;
-            TotalToolCalls = totalToolCalls;
-            ActiveDays = activeDays;
             AvailableModels = new ReadOnlyCollection<string>(availableModels.ToList());
             SelectedModels = new ReadOnlyCollection<string>(selectedModels.ToList());
             FromDate = fromDate;
             ToDate = toDate;
+            ActiveDays = Days.Count(day => !day.IsEmpty);
         }
 
-        public IReadOnlyList<DailyUsage> DailyUsage { get; }
+        /// <summary>Days inside the range that recorded activity, oldest first.</summary>
+        public IReadOnlyList<DailyUsage> Days { get; }
 
-        public IReadOnlyList<ModelTokenTotal> ModelTotals { get; }
+        /// <summary>Selected models with usage in the range, largest first.</summary>
+        public IReadOnlyList<ModelTotal> Models { get; }
 
-        public long TotalTokens { get; }
+        public TokenTotals Tokens { get; }
+
+        public long TotalResponses { get; }
+
+        public long TotalToolCalls { get; }
 
         public long TotalMessages { get; }
 
         public long TotalSessions { get; }
-
-        public long TotalToolCalls { get; }
 
         public int ActiveDays { get; }
 
@@ -131,123 +167,131 @@ namespace ClaudeUsage.Core
 
         public string ToDate { get; }
 
-        /// <summary>
-        /// Always true. stats-cache.json does not contain per-model message, session, or tool counts.
-        /// </summary>
-        public bool ActivityIncludesAllModels => true;
+        /// <summary>True when no model filter narrowed the result.</summary>
+        public bool IncludesAllModels { get; }
 
-        public bool IsEmpty => TotalTokens == 0
-                               && TotalMessages == 0
-                               && TotalSessions == 0
-                               && TotalToolCalls == 0;
+        /// <summary>
+        /// True when a model filter is active. Token, response, and tool-call figures respect it;
+        /// message and session counts are whole-day values because a session spans models.
+        /// </summary>
+        public bool ActivityIsWholeDay
+        {
+            get { return !IncludesAllModels; }
+        }
+
+        public bool IsEmpty
+        {
+            get { return Tokens.IsEmpty && TotalMessages == 0 && TotalSessions == 0 && TotalToolCalls == 0; }
+        }
+
+        public DailyUsage PeakDay(TokenMetric metric)
+        {
+            DailyUsage peak = null;
+            foreach (var day in Days)
+            {
+                if (peak == null || day.Tokens.Select(metric) > peak.Tokens.Select(metric)) peak = day;
+            }
+
+            return peak;
+        }
+
+        public long AveragePerActiveDay(TokenMetric metric)
+        {
+            return ActiveDays == 0 ? 0 : Tokens.Select(metric) / ActiveDays;
+        }
     }
 
     public static class UsageAnalyticsCalculator
     {
-        public static UsageAnalytics Calculate(StatsCacheDocument document, UsageFilter filter)
+        public static UsageAnalytics Calculate(UsageHistory history, UsageFilter filter)
         {
-            if (document == null)
-            {
-                throw new ArgumentNullException(nameof(document));
-            }
-
+            if (history == null) throw new ArgumentNullException(nameof(history));
             filter = filter ?? new UsageFilter();
-            var selectedModels = filter.IncludesAllModels
-                ? new HashSet<string>(document.ModelIds, StringComparer.Ordinal)
+
+            var selected = filter.IncludesAllModels
+                ? new HashSet<string>(history.ModelIds, StringComparer.Ordinal)
                 : new HashSet<string>(filter.ModelIds, StringComparer.Ordinal);
-            var activityByDate = document.DailyActivity.ToDictionary(value => value.Date, StringComparer.Ordinal);
-            var tokensByDate = document.DailyModelTokens.ToDictionary(value => value.Date, StringComparer.Ordinal);
-            var dates = new SortedSet<string>(StringComparer.Ordinal);
 
-            foreach (var date in activityByDate.Keys)
-            {
-                if (DateKey.IsWithinInclusiveRange(date, filter.FromDate, filter.ToDate))
-                {
-                    dates.Add(date);
-                }
-            }
-
-            foreach (var date in tokensByDate.Keys)
-            {
-                if (DateKey.IsWithinInclusiveRange(date, filter.FromDate, filter.ToDate))
-                {
-                    dates.Add(date);
-                }
-            }
-
-            var modelTotals = new Dictionary<string, long>(StringComparer.Ordinal);
-            foreach (var model in selectedModels)
-            {
-                modelTotals[model] = 0;
-            }
-
-            long totalTokens = 0;
+            var days = new List<DailyUsage>();
+            var modelTotals = new Dictionary<string, ModelBuilder>(StringComparer.Ordinal);
+            var tokens = TokenTotals.Zero;
+            long totalResponses = 0;
+            long totalToolCalls = 0;
             long totalMessages = 0;
             long totalSessions = 0;
-            long totalToolCalls = 0;
-            var activeDays = 0;
-            var daily = new List<DailyUsage>();
-            foreach (var date in dates)
+
+            foreach (var day in history.Days)
             {
-                DailyActivity activity;
-                activityByDate.TryGetValue(date, out activity);
-                DailyModelTokens tokenDay;
-                tokensByDate.TryGetValue(date, out tokenDay);
+                if (!DateKey.IsWithinInclusiveRange(day.Date, filter.FromDate, filter.ToDate)) continue;
 
-                long dayTokens = 0;
-                if (tokenDay != null)
+                var dayTokens = TokenTotals.Zero;
+                long dayResponses = 0;
+                long dayToolCalls = 0;
+                foreach (var pair in day.Models)
                 {
-                    foreach (var modelPair in tokenDay.TokensByModel)
+                    if (!selected.Contains(pair.Key)) continue;
+                    var model = pair.Value;
+                    dayTokens = dayTokens.Add(model.Tokens);
+                    dayResponses = Numbers.Add(dayResponses, model.ResponseCount);
+                    dayToolCalls = Numbers.Add(dayToolCalls, model.ToolCallCount);
+
+                    ModelBuilder builder;
+                    if (!modelTotals.TryGetValue(pair.Key, out builder))
                     {
-                        if (!selectedModels.Contains(modelPair.Key))
-                        {
-                            continue;
-                        }
-
-                        dayTokens = SaturatingAdd(dayTokens, modelPair.Value);
-                        long existing;
-                        modelTotals.TryGetValue(modelPair.Key, out existing);
-                        modelTotals[modelPair.Key] = SaturatingAdd(existing, modelPair.Value);
+                        builder = new ModelBuilder(pair.Key);
+                        modelTotals.Add(pair.Key, builder);
                     }
+
+                    builder.Input = Numbers.Add(builder.Input, model.Tokens.InputTokens);
+                    builder.Output = Numbers.Add(builder.Output, model.Tokens.OutputTokens);
+                    builder.CacheRead = Numbers.Add(builder.CacheRead, model.Tokens.CacheReadTokens);
+                    builder.CacheCreation = Numbers.Add(builder.CacheCreation, model.Tokens.CacheCreationTokens);
+                    builder.Responses = Numbers.Add(builder.Responses, model.ResponseCount);
+                    builder.ToolCalls = Numbers.Add(builder.ToolCalls, model.ToolCallCount);
+                    builder.WebSearches = Numbers.Add(builder.WebSearches, model.WebSearchRequests);
                 }
 
-                var messageCount = activity == null ? 0 : activity.MessageCount;
-                var sessionCount = activity == null ? 0 : activity.SessionCount;
-                var toolCallCount = activity == null ? 0 : activity.ToolCallCount;
-                totalTokens = SaturatingAdd(totalTokens, dayTokens);
-                totalMessages = SaturatingAdd(totalMessages, messageCount);
-                totalSessions = SaturatingAdd(totalSessions, sessionCount);
-                totalToolCalls = SaturatingAdd(totalToolCalls, toolCallCount);
-                if (messageCount > 0 || sessionCount > 0 || toolCallCount > 0 || dayTokens > 0)
-                {
-                    activeDays++;
-                }
+                tokens = tokens.Add(dayTokens);
+                totalResponses = Numbers.Add(totalResponses, dayResponses);
+                totalToolCalls = Numbers.Add(totalToolCalls, dayToolCalls);
+                totalMessages = Numbers.Add(totalMessages, day.MessageCount);
+                totalSessions = Numbers.Add(totalSessions, day.SessionCount);
 
-                daily.Add(new DailyUsage(date, dayTokens, messageCount, sessionCount, toolCallCount));
+                days.Add(new DailyUsage(
+                    day.Date,
+                    dayTokens,
+                    dayResponses,
+                    dayToolCalls,
+                    day.MessageCount,
+                    day.SessionCount));
             }
 
+            var models = modelTotals.Values
+                .Select(builder => builder.Build())
+                .Where(model => !model.Tokens.IsEmpty || model.ResponseCount > 0)
+                .Select(model => new ModelTotal(
+                    model.ModelId,
+                    model.Tokens,
+                    model.ResponseCount,
+                    model.ToolCallCount,
+                    model.WebSearchRequests))
+                .OrderByDescending(model => model.Tokens.ProcessedTokens)
+                .ThenBy(model => model.ModelId, StringComparer.Ordinal)
+                .ToList();
+
             return new UsageAnalytics(
-                daily,
-                modelTotals
-                    .Where(pair => pair.Value > 0 || !filter.IncludesAllModels)
-                    .OrderByDescending(pair => pair.Value)
-                    .ThenBy(pair => pair.Key, StringComparer.Ordinal)
-                    .Select(pair => new ModelTokenTotal(pair.Key, pair.Value))
-                    .ToList(),
-                totalTokens,
+                days,
+                models,
+                tokens,
+                totalResponses,
+                totalToolCalls,
                 totalMessages,
                 totalSessions,
-                totalToolCalls,
-                activeDays,
-                document.ModelIds.ToList(),
-                selectedModels.OrderBy(value => value, StringComparer.Ordinal).ToList(),
+                history.ModelIds.ToList(),
+                selected.OrderBy(value => value, StringComparer.Ordinal).ToList(),
+                filter.IncludesAllModels,
                 filter.FromDate,
                 filter.ToDate);
-        }
-
-        private static long SaturatingAdd(long left, long right)
-        {
-            return long.MaxValue - left < right ? long.MaxValue : left + right;
         }
     }
 }

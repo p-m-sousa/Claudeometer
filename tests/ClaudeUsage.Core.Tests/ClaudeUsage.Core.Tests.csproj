@@ -10,13 +10,4 @@
   <ItemGroup>
     <ProjectReference Include="../../src/ClaudeUsage.Core/ClaudeUsage.Core.csproj" />
   </ItemGroup>
-
-  <ItemGroup>
-    <None Include="../fixtures/stats-cache-*.json"
-          Link="fixtures/%(Filename)%(Extension)"
-          CopyToOutputDirectory="PreserveNewest" />
-    <None Include="../fixtures/current-day-projects/**/*"
-          Link="fixtures/current-day-config/projects/%(RecursiveDir)%(Filename)%(Extension)"
-          CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
 </Project>

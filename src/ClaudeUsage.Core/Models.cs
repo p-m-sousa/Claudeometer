@@ -12,13 +12,19 @@ namespace ClaudeUsage.Core
         Error
     }
 
-    public sealed class ParseWarning
+    /// <summary>
+    /// A diagnostic raised while reading local Claude Code data. Locations are deliberately
+    /// coarse ("session transcript line 42") so that project paths never reach the UI or logs.
+    /// </summary>
+    public sealed class UsageWarning
     {
-        public ParseWarning(string code, string message, string path, WarningSeverity severity)
+        public UsageWarning(string code, string message, string location, WarningSeverity severity)
         {
-            Code = code ?? throw new ArgumentNullException(nameof(code));
-            Message = message ?? throw new ArgumentNullException(nameof(message));
-            Path = path ?? string.Empty;
+            if (code == null) throw new ArgumentNullException(nameof(code));
+            if (message == null) throw new ArgumentNullException(nameof(message));
+            Code = code;
+            Message = message;
+            Location = location ?? string.Empty;
             Severity = severity;
         }
 
@@ -26,245 +32,300 @@ namespace ClaudeUsage.Core
 
         public string Message { get; }
 
-        public string Path { get; }
+        public string Location { get; }
 
         public WarningSeverity Severity { get; }
 
+        /// <summary>
+        /// True only for warnings that indicate a scan may have observed a transiently
+        /// incomplete filesystem snapshot and should be retried before publishing totals.
+        /// </summary>
+        public bool IsTransient
+        {
+            get
+            {
+                return Code == "transcript.read_failed"
+                    || Code == "transcripts.enumeration_failed"
+                    || Code == "transcripts.project_enumeration_failed"
+                    || Code == "transcript.changed_during_read"
+                    || Code == "transcript.partial_final_line";
+            }
+        }
+
         public override string ToString()
         {
-            return string.IsNullOrEmpty(Path)
+            return Location.Length == 0
                 ? Code + ": " + Message
-                : Code + " at " + Path + ": " + Message;
+                : Code + " at " + Location + ": " + Message;
         }
-
-        /// <summary>
-        /// True only for warnings that indicate a refresh may have observed a
-        /// transiently incomplete filesystem snapshot and should be retried.
-        /// </summary>
-        public bool IsTransient => Code == "transcript.read_failed"
-                                   || Code == "transcripts.enumeration_failed"
-                                   || Code == "transcripts.project_enumeration_failed"
-                                   || Code == "transcript.changed_during_read"
-                                   || Code == "transcript.partial_final_line";
     }
 
-    public sealed class DailyActivity
+    /// <summary>
+    /// The four token categories Claude Code records for every model response.
+    /// </summary>
+    public sealed class TokenTotals
     {
-        internal DailyActivity(string date, long messageCount, long sessionCount, long toolCallCount)
-        {
-            Date = date;
-            MessageCount = messageCount;
-            SessionCount = sessionCount;
-            ToolCallCount = toolCallCount;
-        }
+        public static readonly TokenTotals Zero = new TokenTotals(0, 0, 0, 0);
 
-        public string Date { get; }
-
-        public long MessageCount { get; }
-
-        public long SessionCount { get; }
-
-        public long ToolCallCount { get; }
-    }
-
-    public sealed class DailyModelTokens
-    {
-        internal DailyModelTokens(string date, IDictionary<string, long> tokensByModel)
-        {
-            Date = date;
-            TokensByModel = CollectionHelpers.ReadOnlyDictionary(tokensByModel, StringComparer.Ordinal);
-        }
-
-        public string Date { get; }
-
-        /// <summary>
-        /// Daily token totals by raw model identifier. The represented categories depend on
-        /// StatsCacheDocument.DailyModelTokensVersion: version 5 includes all four token
-        /// categories, while legacy caches contain input + output only.
-        /// </summary>
-        public IReadOnlyDictionary<string, long> TokensByModel { get; }
-    }
-
-    public sealed class ModelUsage
-    {
-        internal ModelUsage(
-            string modelId,
+        public TokenTotals(
             long inputTokens,
             long outputTokens,
-            long cacheReadInputTokens,
-            long cacheCreationInputTokens,
-            long webSearchRequests,
-            double? costUsd,
-            long? contextWindow,
-            long? maxOutputTokens)
+            long cacheReadTokens,
+            long cacheCreationTokens)
         {
-            ModelId = modelId;
             InputTokens = inputTokens;
             OutputTokens = outputTokens;
-            CacheReadInputTokens = cacheReadInputTokens;
-            CacheCreationInputTokens = cacheCreationInputTokens;
-            WebSearchRequests = webSearchRequests;
-            CostUsd = costUsd;
-            ContextWindow = contextWindow;
-            MaxOutputTokens = maxOutputTokens;
+            CacheReadTokens = cacheReadTokens;
+            CacheCreationTokens = cacheCreationTokens;
         }
-
-        public string ModelId { get; }
 
         public long InputTokens { get; }
 
         public long OutputTokens { get; }
 
-        public long CacheReadInputTokens { get; }
+        public long CacheReadTokens { get; }
 
-        public long CacheCreationInputTokens { get; }
+        public long CacheCreationTokens { get; }
+
+        /// <summary>Input + output. Excludes cache traffic.</summary>
+        public long InputOutputTokens
+        {
+            get { return Numbers.Add(InputTokens, OutputTokens); }
+        }
+
+        /// <summary>Every token Claude Code processed: input + output + cache read + cache creation.</summary>
+        public long ProcessedTokens
+        {
+            get
+            {
+                return Numbers.Add(
+                    Numbers.Add(InputTokens, OutputTokens),
+                    Numbers.Add(CacheReadTokens, CacheCreationTokens));
+            }
+        }
+
+        public bool IsEmpty
+        {
+            get { return ProcessedTokens == 0; }
+        }
+
+        public TokenTotals Add(TokenTotals other)
+        {
+            if (other == null) return this;
+            return new TokenTotals(
+                Numbers.Add(InputTokens, other.InputTokens),
+                Numbers.Add(OutputTokens, other.OutputTokens),
+                Numbers.Add(CacheReadTokens, other.CacheReadTokens),
+                Numbers.Add(CacheCreationTokens, other.CacheCreationTokens));
+        }
+
+        /// <summary>
+        /// Element-wise maximum. Daily totals only ever grow, so this safely merges a freshly
+        /// scanned day with an archived copy of the same day.
+        /// </summary>
+        public TokenTotals Max(TokenTotals other)
+        {
+            if (other == null) return this;
+            return new TokenTotals(
+                Math.Max(InputTokens, other.InputTokens),
+                Math.Max(OutputTokens, other.OutputTokens),
+                Math.Max(CacheReadTokens, other.CacheReadTokens),
+                Math.Max(CacheCreationTokens, other.CacheCreationTokens));
+        }
+
+        public long Select(TokenMetric metric)
+        {
+            return metric == TokenMetric.InputOutput ? InputOutputTokens : ProcessedTokens;
+        }
+    }
+
+    /// <summary>Which token figure a daily threshold is measured against.</summary>
+    public enum TokenMetric
+    {
+        /// <summary>Input + output + cache read + cache creation.</summary>
+        Processed,
+
+        /// <summary>Input + output only.</summary>
+        InputOutput
+    }
+
+    /// <summary>One model's contribution to a single local calendar day.</summary>
+    public sealed class ModelUsage
+    {
+        public ModelUsage(
+            string modelId,
+            TokenTotals tokens,
+            long responseCount,
+            long toolCallCount,
+            long webSearchRequests)
+        {
+            if (modelId == null) throw new ArgumentNullException(nameof(modelId));
+            ModelId = modelId;
+            Tokens = tokens ?? TokenTotals.Zero;
+            ResponseCount = responseCount;
+            ToolCallCount = toolCallCount;
+            WebSearchRequests = webSearchRequests;
+        }
+
+        public string ModelId { get; }
+
+        public TokenTotals Tokens { get; }
+
+        /// <summary>Distinct model responses, after collapsing Claude Code's per-block transcript lines.</summary>
+        public long ResponseCount { get; }
+
+        public long ToolCallCount { get; }
 
         public long WebSearchRequests { get; }
 
-        /// <summary>
-        /// Client-estimated all-time cost when present. A value of zero does not mean the
-        /// user's subscription usage was free.
-        /// </summary>
-        public double? CostUsd { get; }
-
-        public long? ContextWindow { get; }
-
-        public long? MaxOutputTokens { get; }
-    }
-
-    public sealed class LongestSession
-    {
-        internal LongestSession(string sessionId, long durationMilliseconds, long messageCount, string timestamp)
+        public ModelUsage Add(ModelUsage other)
         {
-            SessionId = sessionId;
-            DurationMilliseconds = durationMilliseconds;
-            MessageCount = messageCount;
-            Timestamp = timestamp;
+            if (other == null) return this;
+            return new ModelUsage(
+                ModelId,
+                Tokens.Add(other.Tokens),
+                Numbers.Add(ResponseCount, other.ResponseCount),
+                Numbers.Add(ToolCallCount, other.ToolCallCount),
+                Numbers.Add(WebSearchRequests, other.WebSearchRequests));
         }
 
-        public string SessionId { get; }
-
-        public long DurationMilliseconds { get; }
-
-        public long MessageCount { get; }
-
-        public string Timestamp { get; }
+        public ModelUsage Max(ModelUsage other)
+        {
+            if (other == null) return this;
+            return new ModelUsage(
+                ModelId,
+                Tokens.Max(other.Tokens),
+                Math.Max(ResponseCount, other.ResponseCount),
+                Math.Max(ToolCallCount, other.ToolCallCount),
+                Math.Max(WebSearchRequests, other.WebSearchRequests));
+        }
     }
 
-    public sealed class StatsCacheDocument
+    /// <summary>
+    /// Everything known about one local calendar day. Token, response, and tool-call figures
+    /// are attributable to a model; session and message counts are whole-day figures.
+    /// </summary>
+    public sealed class UsageDay
     {
-        internal StatsCacheDocument(
-            int version,
-            int dailyModelTokensVersion,
-            string lastComputedDate,
-            IList<DailyActivity> dailyActivity,
-            IList<DailyModelTokens> dailyModelTokens,
-            IDictionary<string, ModelUsage> modelUsage,
-            long totalSessions,
-            long totalMessages,
-            LongestSession longestSession,
-            string firstSessionDate,
-            IDictionary<int, long> hourCounts,
-            long totalSpeculationTimeSavedMs,
-            IDictionary<int, long> shotDistribution)
+        public UsageDay(
+            string date,
+            IDictionary<string, ModelUsage> models,
+            long sessionCount,
+            long messageCount)
         {
-            Version = version;
-            DailyModelTokensVersion = dailyModelTokensVersion;
-            LastComputedDate = lastComputedDate;
-            DailyActivity = new ReadOnlyCollection<DailyActivity>(dailyActivity.ToList());
-            DailyModelTokens = new ReadOnlyCollection<DailyModelTokens>(dailyModelTokens.ToList());
-            ModelUsage = CollectionHelpers.ReadOnlyDictionary(modelUsage, StringComparer.Ordinal);
-            TotalSessions = totalSessions;
-            TotalMessages = totalMessages;
-            LongestSession = longestSession;
-            FirstSessionDate = firstSessionDate;
-            HourCounts = CollectionHelpers.ReadOnlyDictionary(hourCounts);
-            TotalSpeculationTimeSavedMs = totalSpeculationTimeSavedMs;
-            ShotDistribution = CollectionHelpers.ReadOnlyDictionary(shotDistribution);
+            if (date == null) throw new ArgumentNullException(nameof(date));
+            Date = date;
+            Models = Collections.ReadOnly(models ?? new Dictionary<string, ModelUsage>(StringComparer.Ordinal));
+            SessionCount = sessionCount;
+            MessageCount = messageCount;
 
-            var modelIds = new HashSet<string>(modelUsage.Keys, StringComparer.Ordinal);
-            foreach (var day in dailyModelTokens)
+            var tokens = TokenTotals.Zero;
+            long responses = 0;
+            long toolCalls = 0;
+            long webSearches = 0;
+            foreach (var model in Models.Values)
             {
-                foreach (var modelId in day.TokensByModel.Keys)
+                tokens = tokens.Add(model.Tokens);
+                responses = Numbers.Add(responses, model.ResponseCount);
+                toolCalls = Numbers.Add(toolCalls, model.ToolCallCount);
+                webSearches = Numbers.Add(webSearches, model.WebSearchRequests);
+            }
+
+            Tokens = tokens;
+            ResponseCount = responses;
+            ToolCallCount = toolCalls;
+            WebSearchRequests = webSearches;
+        }
+
+        /// <summary>Local calendar date as YYYY-MM-DD.</summary>
+        public string Date { get; }
+
+        public IReadOnlyDictionary<string, ModelUsage> Models { get; }
+
+        /// <summary>Sessions whose first transcript entry falls on this date.</summary>
+        public long SessionCount { get; }
+
+        /// <summary>Transcript messages on this date, across every model.</summary>
+        public long MessageCount { get; }
+
+        public TokenTotals Tokens { get; }
+
+        public long ResponseCount { get; }
+
+        public long ToolCallCount { get; }
+
+        public long WebSearchRequests { get; }
+
+        public bool IsEmpty
+        {
+            get { return Tokens.IsEmpty && MessageCount == 0 && SessionCount == 0 && ToolCallCount == 0; }
+        }
+    }
+
+    /// <summary>A complete local usage history, ordered oldest day first.</summary>
+    public sealed class UsageHistory
+    {
+        public static readonly UsageHistory Empty = new UsageHistory(new UsageDay[0]);
+
+        public UsageHistory(IEnumerable<UsageDay> days)
+        {
+            if (days == null) throw new ArgumentNullException(nameof(days));
+            var ordered = days
+                .Where(day => day != null)
+                .OrderBy(day => day.Date, StringComparer.Ordinal)
+                .ToList();
+            Days = new ReadOnlyCollection<UsageDay>(ordered);
+
+            var modelIds = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (var day in ordered)
+            {
+                foreach (var modelId in day.Models.Keys)
                 {
                     modelIds.Add(modelId);
                 }
             }
 
-            ModelIds = new ReadOnlyCollection<string>(modelIds.OrderBy(value => value, StringComparer.Ordinal).ToList());
+            ModelIds = new ReadOnlyCollection<string>(modelIds.ToList());
+            FirstDate = ordered.Count == 0 ? null : ordered[0].Date;
+            LastDate = ordered.Count == 0 ? null : ordered[ordered.Count - 1].Date;
         }
 
-        public int Version { get; }
+        public IReadOnlyList<UsageDay> Days { get; }
 
-        /// <summary>
-        /// Version of Claude Code's daily token aggregation. Version 5 and later includes
-        /// input, output, cache-read, and cache-creation tokens; older data is input + output.
-        /// </summary>
-        public int DailyModelTokensVersion { get; }
-
-        public bool DailyTokensIncludeCache => DailyModelTokensVersion >= 5;
-
-        public string LastComputedDate { get; }
-
-        public IReadOnlyList<DailyActivity> DailyActivity { get; }
-
-        public IReadOnlyList<DailyModelTokens> DailyModelTokens { get; }
-
-        public IReadOnlyDictionary<string, ModelUsage> ModelUsage { get; }
-
-        public long TotalSessions { get; }
-
-        public long TotalMessages { get; }
-
-        public LongestSession LongestSession { get; }
-
-        public string FirstSessionDate { get; }
-
-        public IReadOnlyDictionary<int, long> HourCounts { get; }
-
-        public long TotalSpeculationTimeSavedMs { get; }
-
-        public IReadOnlyDictionary<int, long> ShotDistribution { get; }
-
-        /// <summary>
-        /// Sorted union of model identifiers found in all-time model usage and every daily record.
-        /// </summary>
         public IReadOnlyList<string> ModelIds { get; }
+
+        public string FirstDate { get; }
+
+        public string LastDate { get; }
+
+        public UsageDay FindDay(string date)
+        {
+            foreach (var day in Days)
+            {
+                if (string.Equals(day.Date, date, StringComparison.Ordinal)) return day;
+            }
+
+            return null;
+        }
     }
 
-    public sealed class StatsCacheParseResult
+    /// <summary>Saturating arithmetic. Counters are never allowed to wrap or go negative.</summary>
+    internal static class Numbers
     {
-        internal StatsCacheParseResult(StatsCacheDocument document, IList<ParseWarning> warnings, bool isUsable)
+        internal static long Add(long left, long right)
         {
-            Document = document;
-            Warnings = new ReadOnlyCollection<ParseWarning>(warnings.ToList());
-            IsUsable = isUsable;
+            if (right > 0 && left > long.MaxValue - right) return long.MaxValue;
+            if (right < 0 && left < long.MinValue - right) return long.MinValue;
+            return left + right;
         }
-
-        public StatsCacheDocument Document { get; }
-
-        public IReadOnlyList<ParseWarning> Warnings { get; }
-
-        /// <summary>
-        /// False only when the input could not be parsed as a JSON object. A structurally sparse
-        /// but valid object remains usable and carries warnings.
-        /// </summary>
-        public bool IsUsable { get; }
     }
 
-    internal static class CollectionHelpers
+    internal static class Collections
     {
-        internal static IReadOnlyDictionary<TKey, TValue> ReadOnlyDictionary<TKey, TValue>(
-            IDictionary<TKey, TValue> source)
+        internal static IReadOnlyDictionary<string, TValue> ReadOnly<TValue>(IDictionary<string, TValue> source)
         {
-            return new ReadOnlyDictionary<TKey, TValue>(new Dictionary<TKey, TValue>(source));
-        }
-
-        internal static IReadOnlyDictionary<string, TValue> ReadOnlyDictionary<TValue>(
-            IDictionary<string, TValue> source,
-            IEqualityComparer<string> comparer)
-        {
-            return new ReadOnlyDictionary<string, TValue>(new Dictionary<string, TValue>(source, comparer));
+            return new ReadOnlyDictionary<string, TValue>(
+                new Dictionary<string, TValue>(source, StringComparer.Ordinal));
         }
     }
 }

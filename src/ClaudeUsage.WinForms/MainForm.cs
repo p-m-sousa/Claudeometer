@@ -15,57 +15,81 @@ namespace ClaudeUsage.WinForms
     internal sealed class MainForm : Form
     {
         private const string AllModelsLabel = "All models";
-        private const string EmptyCacheJson = "{\"version\":5,\"dailyModelTokensVersion\":5,\"dailyActivity\":[],\"dailyModelTokens\":[],\"modelUsage\":{},\"totalSessions\":0,\"totalMessages\":0,\"hourCounts\":{}}";
 
-        private readonly SettingsStore _settings = new SettingsStore();
-        private readonly CancellationTokenSource _lifetimeCancellation = new CancellationTokenSource();
+        private readonly AppSettings _settings;
+        private readonly UsageStore _store;
+        private readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
         private readonly ToolTip _toolTip = new ToolTip();
-        private readonly Dictionary<string, Label> _todayValues = new Dictionary<string, Label>(StringComparer.Ordinal);
-        private readonly Dictionary<string, Label> _historyValues = new Dictionary<string, Label>(StringComparer.Ordinal);
+        private readonly Dictionary<string, Label> _todayCards = new Dictionary<string, Label>(StringComparer.Ordinal);
+        private readonly Dictionary<string, Label> _rangeCards = new Dictionary<string, Label>(StringComparer.Ordinal);
         private readonly System.Windows.Forms.Timer _refreshTimer = new System.Windows.Forms.Timer();
-        private readonly System.Windows.Forms.Timer _watchDebounceTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _watchDebounce = new System.Windows.Forms.Timer();
+        private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
 
-        private string _sourcePath;
-        private FileSystemWatcher _cacheWatcher;
-        private FileSystemWatcher _projectsWatcher;
-        private StatsCacheDocument _historyDocument;
-        private StatsCacheDocument _combinedDocument;
-        private TodayUsageSnapshot _todaySnapshot;
+        private UsageHistory _history = UsageHistory.Empty;
+        private ScanReport _report;
+        private UsageAnalytics _rangeAnalytics;
+        private IList<string> _roots = new List<string>();
+        private int _archivedOnlyDays;
         private bool _refreshing;
         private bool _refreshQueued;
         private bool _updatingFilters;
+        private bool _exiting;
+        private Icon _appIcon;
+        private NotifyIcon _tray;
 
         private Label _sourceLabel;
-        private Label _sourceStateLabel;
+        private Label _stateBadge;
         private Label _todayHeading;
         private Label _todayNotice;
         private Label _todaySecondary;
-        private Label _historyNotice;
+        private Label _thresholdLabel;
+        private ProgressBar _thresholdBar;
+        private Button _thresholdButton;
+        private Label _rangeNotice;
+        private Label _modelsNotice;
         private Button _refreshButton;
         private ComboBox _refreshInterval;
         private DataGridView _todayModelsGrid;
-        private DataGridView _historyGrid;
-        private DataGridView _allTimeGrid;
+        private DataGridView _dailyGrid;
+        private DataGridView _modelsGrid;
         private ComboBox _rangePreset;
         private ComboBox _modelFilter;
         private DateTimePicker _fromDate;
         private DateTimePicker _toDate;
-        private Chart _historyChart;
+        private Chart _dailyChart;
         private ToolStripStatusLabel _statusLabel;
         private ToolStripStatusLabel _freshnessLabel;
 
-        public MainForm(string explicitPath)
+        internal MainForm(IEnumerable<string> commandLineSources)
         {
-            _sourcePath = StatsFileLoader.ResolveDefaultPath(explicitPath, _settings.ReadSourcePath());
+            _settings = new AppSettings();
+            if (commandLineSources != null)
+            {
+                var provided = commandLineSources
+                    .Select(ClaudeDataLocator.NormalizeChosenFolder)
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .ToList();
+                if (provided.Count > 0)
+                {
+                    _settings.ReplaceSources(provided);
+                    _settings.AutoDetectSources = false;
+                }
+            }
+
+            _store = new UsageStore(AppSettings.StorePath);
             InitializeWindow();
             BuildInterface();
             ConfigureTimers();
+            ConfigureTray();
 
             Shown += async (sender, args) =>
             {
-                SetupWatcher();
-                await RefreshDashboardAsync(false);
+                await Task.Run(() => _store.Load(TimeZoneInfo.Local));
+                SetupWatchers();
+                await RefreshAsync(false);
             };
+            Resize += OnResize;
             FormClosing += OnFormClosing;
         }
 
@@ -73,20 +97,20 @@ namespace ClaudeUsage.WinForms
         {
             Text = "Claude Usage";
             StartPosition = FormStartPosition.CenterScreen;
-            // Keep the window usable on small/high-DPI displays. The tab bodies
-            // scroll, and the KPI cards reflow into two rows.
-            MinimumSize = new Size(520, 360);
+            MinimumSize = new Size(560, 400);
             var workArea = Screen.PrimaryScreen == null
-                ? new Rectangle(0, 0, 1180, 720)
+                ? new Rectangle(0, 0, 1200, 760)
                 : Screen.PrimaryScreen.WorkingArea;
             Size = new Size(
-                Math.Min(1180, Math.Max(MinimumSize.Width, workArea.Width - 32)),
-                Math.Min(720, Math.Max(MinimumSize.Height, workArea.Height - 32)));
+                Math.Min(1200, Math.Max(MinimumSize.Width, workArea.Width - 32)),
+                Math.Min(780, Math.Max(MinimumSize.Height, workArea.Height - 32)));
             AutoScaleMode = AutoScaleMode.Dpi;
             BackColor = Palette.Window;
             ForeColor = Palette.Text;
             Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
             KeyPreview = true;
+            _appIcon = AppIcon.Create();
+            if (_appIcon != null) Icon = _appIcon;
         }
 
         private void BuildInterface()
@@ -103,20 +127,18 @@ namespace ClaudeUsage.WinForms
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             Controls.Add(root);
-
             root.Controls.Add(BuildHeader(), 0, 0);
 
             var tabs = new TabControl
             {
                 Dock = DockStyle.Fill,
-                Font = new Font(Font, FontStyle.Regular),
                 Padding = new Point(18, 7),
-                Margin = new Padding(0, 14, 0, 8),
+                Margin = new Padding(0, 12, 0, 8),
                 AccessibleName = "Usage views"
             };
             tabs.TabPages.Add(BuildTodayTab());
             tabs.TabPages.Add(BuildHistoryTab());
-            tabs.TabPages.Add(BuildAllTimeTab());
+            tabs.TabPages.Add(BuildModelsTab());
             root.Controls.Add(tabs, 0, 1);
 
             var status = new StatusStrip
@@ -126,8 +148,15 @@ namespace ClaudeUsage.WinForms
                 BackColor = Palette.Window,
                 Padding = new Padding(0, 4, 0, 4)
             };
-            _statusLabel = new ToolStripStatusLabel("Waiting to load…") { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-            _freshnessLabel = new ToolStripStatusLabel("Local only · Read-only") { TextAlign = ContentAlignment.MiddleRight };
+            _statusLabel = new ToolStripStatusLabel("Starting…")
+            {
+                Spring = true,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            _freshnessLabel = new ToolStripStatusLabel("Local only - read-only")
+            {
+                TextAlign = ContentAlignment.MiddleRight
+            };
             status.Items.Add(_statusLabel);
             status.Items.Add(_freshnessLabel);
             root.Controls.Add(status, 0, 2);
@@ -139,73 +168,63 @@ namespace ClaudeUsage.WinForms
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
-                ColumnCount = 4,
+                ColumnCount = 6,
                 RowCount = 2,
                 BackColor = Palette.Window,
                 Margin = new Padding(0)
             };
             header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            for (var index = 0; index < 4; index++) header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            var title = new Label
+            header.Controls.Add(new Label
             {
                 Text = "Claude Usage",
                 AutoSize = true,
-                Font = new Font("Segoe UI Semibold", 21F, FontStyle.Bold, GraphicsUnit.Point),
+                Font = new Font("Segoe UI Semibold", 20F, FontStyle.Bold, GraphicsUnit.Point),
                 ForeColor = Palette.Heading,
-                Margin = new Padding(0, 0, 18, 2)
-            };
-            header.Controls.Add(title, 0, 0);
+                Margin = new Padding(0, 0, 16, 2)
+            }, 0, 0);
 
-            _sourceStateLabel = new Label
+            _stateBadge = new Label
             {
-                Text = "NOT LOADED",
+                Text = "STARTING",
                 AutoSize = true,
                 BackColor = Palette.NeutralBadge,
                 ForeColor = Palette.Muted,
                 Font = new Font("Segoe UI Semibold", 8F, FontStyle.Bold, GraphicsUnit.Point),
                 Padding = new Padding(8, 5, 8, 5),
-                Margin = new Padding(0, 7, 0, 0)
+                Margin = new Padding(0, 8, 0, 0)
             };
-            header.Controls.Add(_sourceStateLabel, 1, 0);
+            header.Controls.Add(_stateBadge, 1, 0);
 
-            _refreshButton = new Button
-            {
-                Text = "Refresh now",
-                AutoSize = true,
-                FlatStyle = FlatStyle.System,
-                Margin = new Padding(8, 3, 0, 0),
-                AccessibleDescription = "Reread the cache and current-day local usage files"
-            };
-            _refreshButton.Click += async (sender, args) => await RefreshDashboardAsync(true);
+            _refreshButton = HeaderButton("Refresh now", "Rescan local Claude Code transcripts");
+            _refreshButton.Click += async (sender, args) => await RefreshAsync(true);
             header.Controls.Add(_refreshButton, 2, 0);
 
-            var chooseButton = new Button
-            {
-                Text = "Choose cache…",
-                AutoSize = true,
-                FlatStyle = FlatStyle.System,
-                Margin = new Padding(8, 3, 0, 0),
-                AccessibleDescription = "Choose a Claude Code stats-cache.json file"
-            };
-            chooseButton.Click += ChooseSource;
-            header.Controls.Add(chooseButton, 3, 0);
+            var exportButton = HeaderButton("Export PDF…", "Save the selected range as a PDF report");
+            exportButton.Click += (sender, args) => ExportPdf();
+            header.Controls.Add(exportButton, 3, 0);
+
+            var sourcesButton = HeaderButton("Data sources…", "Choose where Claude Code data is read from");
+            sourcesButton.Click += (sender, args) => EditSources();
+            header.Controls.Add(sourcesButton, 4, 0);
+
+            var alertsButton = HeaderButton("Alerts…", "Set a daily token threshold and warning level");
+            alertsButton.Click += (sender, args) => EditAlerts();
+            header.Controls.Add(alertsButton, 5, 0);
 
             _sourceLabel = new Label
             {
-                Text = _sourcePath,
+                Text = "Looking for Claude Code data…",
                 AutoEllipsis = true,
                 Dock = DockStyle.Fill,
-                Height = 25,
+                Height = 24,
                 ForeColor = Palette.Muted,
-                Margin = new Padding(1, 3, 14, 0),
-                AccessibleName = "Usage source path",
-                AccessibleDescription = _sourcePath
+                Margin = new Padding(1, 2, 14, 0),
+                AccessibleName = "Claude data locations"
             };
-            _toolTip.SetToolTip(_sourceLabel, _sourcePath);
-            header.SetColumnSpan(_sourceLabel, 2);
+            header.SetColumnSpan(_sourceLabel, 3);
             header.Controls.Add(_sourceLabel, 0, 1);
 
             var intervalPanel = new FlowLayoutPanel
@@ -238,8 +257,8 @@ namespace ClaudeUsage.WinForms
                 new RefreshChoice("Off", 0)
             });
             intervalPanel.Controls.Add(_refreshInterval);
-            header.SetColumnSpan(intervalPanel, 2);
-            header.Controls.Add(intervalPanel, 2, 1);
+            header.SetColumnSpan(intervalPanel, 3);
+            header.Controls.Add(intervalPanel, 3, 1);
             return header;
         }
 
@@ -249,52 +268,36 @@ namespace ClaudeUsage.WinForms
             var content = NewScrollableStack();
             tab.Controls.Add(content);
 
-            _todayHeading = SectionTitle("Today’s cumulative local usage");
+            _todayHeading = SectionTitle("Today");
             content.Controls.Add(_todayHeading, 0, 0);
-
             _todayNotice = NoticeLabel(
-                "Live from Claude Code transcript usage metadata. Tokens, messages, and tool calls use each entry’s UTC date; session counts use the date the session began. Processed tokens are local counters, not remaining plan quota.");
+                "Live from Claude Code's own session transcripts. Every figure is a locally recorded token count, not a bill and not your remaining plan allowance.");
             content.Controls.Add(_todayNotice, 0, 1);
 
-            var cards = new TableLayoutPanel
-            {
-                Dock = DockStyle.Top,
-                AutoSize = true,
-                ColumnCount = 3,
-                RowCount = 2,
-                Margin = new Padding(0, 15, 0, 10)
-            };
-            for (var i = 0; i < 3; i++) cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333F));
-            cards.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            cards.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            cards.Controls.Add(CreateCard("Processed tokens", "processed", _todayValues, Palette.Accent), 0, 0);
-            cards.Controls.Add(CreateCard("Input", "input", _todayValues, Palette.Blue), 1, 0);
-            cards.Controls.Add(CreateCard("Output", "output", _todayValues, Palette.Green), 2, 0);
-            cards.Controls.Add(CreateCard("Cache read", "cacheRead", _todayValues, Palette.Purple), 0, 1);
-            cards.Controls.Add(CreateCard("Cache creation", "cacheCreate", _todayValues, Palette.Orange), 1, 1);
-            cards.Controls.Add(CreateCard("I/O tokens", "io", _todayValues, Palette.Teal), 2, 1);
-            content.Controls.Add(cards, 0, 2);
+            content.Controls.Add(BuildCardGrid(_todayCards), 0, 2);
 
             _todaySecondary = new Label
             {
-                Text = "Sessions 0   ·   Messages 0   ·   Tool calls 0",
+                Text = "Responses 0   -   Messages 0   -   Tool calls 0   -   Sessions 0",
                 AutoSize = true,
                 ForeColor = Palette.Muted,
                 Font = new Font("Segoe UI Semibold", 9.5F, FontStyle.Bold, GraphicsUnit.Point),
-                Margin = new Padding(2, 0, 0, 14)
+                Margin = new Padding(2, 2, 0, 10)
             };
             content.Controls.Add(_todaySecondary, 0, 3);
+            content.Controls.Add(BuildThresholdPanel(), 0, 4);
 
-            content.Controls.Add(SubsectionTitle("Today by model"), 0, 4);
-            _todayModelsGrid = CreateGrid("Current-day token categories by model");
-            AddTextColumn(_todayModelsGrid, "Model", 260, DataGridViewAutoSizeColumnMode.Fill);
+            content.Controls.Add(SubsectionTitle("Today by model"), 0, 5);
+            _todayModelsGrid = CreateGrid("Today's token categories by model");
+            AddTextColumn(_todayModelsGrid, "Model", 240, DataGridViewAutoSizeColumnMode.Fill);
             AddNumberColumn(_todayModelsGrid, "Input");
             AddNumberColumn(_todayModelsGrid, "Output");
             AddNumberColumn(_todayModelsGrid, "Cache read");
             AddNumberColumn(_todayModelsGrid, "Cache creation");
             AddNumberColumn(_todayModelsGrid, "Processed");
-            _todayModelsGrid.Height = 245;
-            content.Controls.Add(_todayModelsGrid, 0, 5);
+            AddNumberColumn(_todayModelsGrid, "Responses");
+            _todayModelsGrid.Height = 210;
+            content.Controls.Add(_todayModelsGrid, 0, 6);
             return tab;
         }
 
@@ -304,70 +307,131 @@ namespace ClaudeUsage.WinForms
             var content = NewScrollableStack();
             tab.Controls.Add(content);
 
-            content.Controls.Add(SectionTitle("Historical slices"), 0, 0);
-            _historyNotice = NoticeLabel(
-                "Current Claude Code history records processed tokens: input + output + cache read + cache creation. Activity counts are date-filtered but cannot be attributed to a model in this cache.");
-            content.Controls.Add(_historyNotice, 0, 1);
-            content.Controls.Add(BuildHistoryFilters(), 0, 2);
+            content.Controls.Add(SectionTitle("Date range"), 0, 0);
+            _rangeNotice = NoticeLabel(
+                "Pick any range. Token, response, and tool-call figures follow the model filter; message and session counts are whole-day totals.");
+            content.Controls.Add(_rangeNotice, 0, 1);
+            content.Controls.Add(BuildFilters(), 0, 2);
+            content.Controls.Add(BuildCardGrid(_rangeCards), 0, 3);
 
+            _dailyChart = BuildChart();
+            content.Controls.Add(_dailyChart, 0, 4);
+
+            content.Controls.Add(SubsectionTitle("Daily values"), 0, 5);
+            _dailyGrid = CreateGrid("Exact values by date");
+            AddTextColumn(_dailyGrid, "Date", 105, DataGridViewAutoSizeColumnMode.None);
+            AddNumberColumn(_dailyGrid, "Input");
+            AddNumberColumn(_dailyGrid, "Output");
+            AddNumberColumn(_dailyGrid, "Cache read");
+            AddNumberColumn(_dailyGrid, "Cache creation");
+            AddNumberColumn(_dailyGrid, "Processed");
+            AddNumberColumn(_dailyGrid, "Responses");
+            AddNumberColumn(_dailyGrid, "Tool calls");
+            AddNumberColumn(_dailyGrid, "Sessions");
+            _dailyGrid.Height = 280;
+            content.Controls.Add(_dailyGrid, 0, 6);
+            return tab;
+        }
+
+        private TabPage BuildModelsTab()
+        {
+            var tab = NewTab("Models");
+            var content = NewScrollableStack();
+            tab.Controls.Add(content);
+            content.Controls.Add(SectionTitle("Totals by model"), 0, 0);
+            _modelsNotice = NoticeLabel(
+                "These totals use the date range and model filter from the History tab.");
+            content.Controls.Add(_modelsNotice, 0, 1);
+
+            _modelsGrid = CreateGrid("Token categories by model for the selected range");
+            AddTextColumn(_modelsGrid, "Model", 240, DataGridViewAutoSizeColumnMode.Fill);
+            AddNumberColumn(_modelsGrid, "Input");
+            AddNumberColumn(_modelsGrid, "Output");
+            AddNumberColumn(_modelsGrid, "Cache read");
+            AddNumberColumn(_modelsGrid, "Cache creation");
+            AddNumberColumn(_modelsGrid, "Processed");
+            AddNumberColumn(_modelsGrid, "Responses");
+            AddNumberColumn(_modelsGrid, "Tool calls");
+            AddNumberColumn(_modelsGrid, "Web searches");
+            _modelsGrid.Height = 430;
+            _modelsGrid.Margin = new Padding(0, 14, 0, 0);
+            content.Controls.Add(_modelsGrid, 0, 2);
+            return tab;
+        }
+
+        private Control BuildCardGrid(IDictionary<string, Label> target)
+        {
             var cards = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 ColumnCount = 3,
                 RowCount = 2,
-                Margin = new Padding(0, 14, 0, 12)
+                Margin = new Padding(0, 14, 0, 8)
             };
-            for (var i = 0; i < 3; i++) cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333F));
+            for (var index = 0; index < 3; index++) cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333F));
             cards.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             cards.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            cards.Controls.Add(CreateCard("Processed tokens", "tokens", _historyValues, Palette.Teal), 0, 0);
-            cards.Controls.Add(CreateCard("Messages · all models", "messages", _historyValues, Palette.Blue), 1, 0);
-            cards.Controls.Add(CreateCard("Sessions · all models", "sessions", _historyValues, Palette.Green), 2, 0);
-            cards.Controls.Add(CreateCard("Tool calls · all models", "tools", _historyValues, Palette.Purple), 0, 1);
-            cards.Controls.Add(CreateCard("Active days", "days", _historyValues, Palette.Orange), 1, 1);
-            content.Controls.Add(cards, 0, 3);
-
-            _historyChart = BuildHistoryChart();
-            content.Controls.Add(_historyChart, 0, 4);
-
-            content.Controls.Add(SubsectionTitle("Daily values"), 0, 5);
-            _historyGrid = CreateGrid("Exact historical values by date");
-            AddTextColumn(_historyGrid, "Date", 125, DataGridViewAutoSizeColumnMode.None);
-            AddNumberColumn(_historyGrid, "Processed tokens");
-            AddNumberColumn(_historyGrid, "Messages · all models");
-            AddNumberColumn(_historyGrid, "Sessions · all models");
-            AddNumberColumn(_historyGrid, "Tool calls · all models");
-            _historyGrid.Height = 270;
-            content.Controls.Add(_historyGrid, 0, 6);
-            return tab;
+            cards.Controls.Add(CreateCard("Processed tokens", "processed", target, Palette.Accent), 0, 0);
+            cards.Controls.Add(CreateCard("Input", "input", target, Palette.Blue), 1, 0);
+            cards.Controls.Add(CreateCard("Output", "output", target, Palette.Green), 2, 0);
+            cards.Controls.Add(CreateCard("Cache read", "cacheRead", target, Palette.Purple), 0, 1);
+            cards.Controls.Add(CreateCard("Cache creation", "cacheCreate", target, Palette.Orange), 1, 1);
+            cards.Controls.Add(CreateCard("Input + output", "io", target, Palette.Teal), 2, 1);
+            return cards;
         }
 
-        private TabPage BuildAllTimeTab()
+        private Control BuildThresholdPanel()
         {
-            var tab = NewTab("All-time details");
-            var content = NewScrollableStack();
-            tab.Controls.Add(content);
-            content.Controls.Add(SectionTitle("All-time model details"), 0, 0);
-            content.Controls.Add(NoticeLabel(
-                "These category totals come from the cache plus the current UTC day. They cannot be date-filtered. Cost, when present, is Claude Code’s local value and is not an invoice or subscription usage amount."), 0, 1);
+            var panel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 2,
+                BackColor = Palette.Card,
+                Padding = new Padding(12, 10, 12, 12),
+                Margin = new Padding(0, 0, 0, 6)
+            };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            _allTimeGrid = CreateGrid("All-time token categories by model");
-            AddTextColumn(_allTimeGrid, "Model", 260, DataGridViewAutoSizeColumnMode.Fill);
-            AddNumberColumn(_allTimeGrid, "Input");
-            AddNumberColumn(_allTimeGrid, "Output");
-            AddNumberColumn(_allTimeGrid, "Cache read");
-            AddNumberColumn(_allTimeGrid, "Cache creation");
-            AddNumberColumn(_allTimeGrid, "Processed");
-            AddNumberColumn(_allTimeGrid, "Web searches");
-            AddTextColumn(_allTimeGrid, "Local cost", 105, DataGridViewAutoSizeColumnMode.None);
-            _allTimeGrid.Height = 440;
-            _allTimeGrid.Margin = new Padding(0, 16, 0, 0);
-            content.Controls.Add(_allTimeGrid, 0, 2);
-            return tab;
+            _thresholdLabel = new Label
+            {
+                Text = "No daily threshold is set.",
+                AutoSize = true,
+                ForeColor = Palette.Text,
+                Font = new Font("Segoe UI Semibold", 9.5F, FontStyle.Bold, GraphicsUnit.Point),
+                Margin = new Padding(2, 2, 0, 6)
+            };
+            panel.Controls.Add(_thresholdLabel, 0, 0);
+
+            _thresholdButton = new Button
+            {
+                Text = "Set threshold…",
+                AutoSize = true,
+                FlatStyle = FlatStyle.System,
+                Margin = new Padding(10, 0, 0, 0)
+            };
+            _thresholdButton.Click += (sender, args) => EditAlerts();
+            panel.Controls.Add(_thresholdButton, 1, 0);
+
+            _thresholdBar = new ProgressBar
+            {
+                Dock = DockStyle.Fill,
+                Height = 14,
+                Minimum = 0,
+                Maximum = 100,
+                Value = 0,
+                Visible = false,
+                AccessibleName = "Share of the daily threshold used today"
+            };
+            panel.SetColumnSpan(_thresholdBar, 2);
+            panel.Controls.Add(_thresholdBar, 0, 1);
+            return panel;
         }
 
-        private Control BuildHistoryFilters()
+        private Control BuildFilters()
         {
             var panel = new FlowLayoutPanel
             {
@@ -384,25 +448,29 @@ namespace ClaudeUsage.WinForms
             _rangePreset = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                Width = 125,
-                AccessibleName = "History date preset"
+                Width = 130,
+                AccessibleName = "Date range preset"
             };
-            _rangePreset.Items.AddRange(new object[] { "Today", "Last 7 days", "Last 30 days", "Last 90 days", "All time", "Custom" });
-            _rangePreset.SelectedIndex = 2;
+            _rangePreset.Items.AddRange(new object[]
+            {
+                "Today", "Yesterday", "Last 7 days", "Last 30 days", "Last 90 days",
+                "This month", "Last month", "All time", "Custom"
+            });
+            _rangePreset.SelectedIndex = 3;
             _rangePreset.SelectedIndexChanged += (sender, args) =>
             {
                 if (_updatingFilters) return;
                 ApplyPresetDates();
-                RenderHistory();
+                RenderRange();
             };
             panel.Controls.Add(_rangePreset);
 
             panel.Controls.Add(FilterLabel("From"));
-            _fromDate = DatePicker("History start date");
+            _fromDate = DatePicker("Range start date");
             _fromDate.ValueChanged += (sender, args) => OnCustomDateChanged();
             panel.Controls.Add(_fromDate);
             panel.Controls.Add(FilterLabel("To"));
-            _toDate = DatePicker("History end date");
+            _toDate = DatePicker("Range end date");
             _toDate.ValueChanged += (sender, args) => OnCustomDateChanged();
             panel.Controls.Add(_toDate);
 
@@ -410,14 +478,14 @@ namespace ClaudeUsage.WinForms
             _modelFilter = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                Width = 270,
-                AccessibleName = "History model filter"
+                Width = 250,
+                AccessibleName = "Model filter"
             };
             _modelFilter.Items.Add(AllModelsLabel);
             _modelFilter.SelectedIndex = 0;
             _modelFilter.SelectedIndexChanged += (sender, args) =>
             {
-                if (!_updatingFilters) RenderHistory();
+                if (!_updatingFilters) RenderRange();
             };
             panel.Controls.Add(_modelFilter);
 
@@ -425,11 +493,11 @@ namespace ClaudeUsage.WinForms
             reset.Click += (sender, args) =>
             {
                 _updatingFilters = true;
-                _rangePreset.SelectedIndex = 2;
+                _rangePreset.SelectedIndex = 3;
                 _modelFilter.SelectedIndex = 0;
                 _updatingFilters = false;
                 ApplyPresetDates();
-                RenderHistory();
+                RenderRange();
             };
             panel.Controls.Add(reset);
             return panel;
@@ -437,26 +505,49 @@ namespace ClaudeUsage.WinForms
 
         private void ConfigureTimers()
         {
-            _refreshTimer.Tick += async (sender, args) => await RefreshDashboardAsync(false);
-            _watchDebounceTimer.Interval = 900;
-            _watchDebounceTimer.Tick += async (sender, args) =>
+            _refreshTimer.Tick += async (sender, args) => await RefreshAsync(false);
+            _watchDebounce.Interval = 1200;
+            _watchDebounce.Tick += async (sender, args) =>
             {
-                _watchDebounceTimer.Stop();
-                await RefreshDashboardAsync(false);
+                _watchDebounce.Stop();
+                await RefreshAsync(false);
             };
 
-            var savedSeconds = _settings.ReadRefreshSeconds();
             for (var index = 0; index < _refreshInterval.Items.Count; index++)
             {
-                if (((RefreshChoice)_refreshInterval.Items[index]).Seconds == savedSeconds)
+                if (((RefreshChoice)_refreshInterval.Items[index]).Seconds == _settings.RefreshSeconds)
                 {
                     _refreshInterval.SelectedIndex = index;
                     break;
                 }
             }
+
             if (_refreshInterval.SelectedIndex < 0) _refreshInterval.SelectedIndex = 1;
             _refreshInterval.SelectedIndexChanged += (sender, args) => ApplyRefreshInterval(true);
             ApplyRefreshInterval(false);
+        }
+
+        private void ConfigureTray()
+        {
+            _tray = new NotifyIcon
+            {
+                Text = "Claude Usage",
+                Visible = false
+            };
+            if (_appIcon != null) _tray.Icon = _appIcon;
+
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("Show Claude Usage", null, (sender, args) => RestoreFromTray());
+            menu.Items.Add("Refresh now", null, async (sender, args) => await RefreshAsync(true));
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Exit", null, (sender, args) =>
+            {
+                _exiting = true;
+                Close();
+            });
+            _tray.ContextMenuStrip = menu;
+            _tray.DoubleClick += (sender, args) => RestoreFromTray();
+            _tray.BalloonTipClicked += (sender, args) => RestoreFromTray();
         }
 
         private void ApplyRefreshInterval(bool persist)
@@ -466,13 +557,41 @@ namespace ClaudeUsage.WinForms
             _refreshTimer.Stop();
             if (seconds > 0)
             {
-                _refreshTimer.Interval = checked(seconds * 1000);
+                _refreshTimer.Interval = seconds * 1000;
                 _refreshTimer.Start();
             }
-            if (persist) _settings.WriteRefreshSeconds(seconds);
+
+            if (!persist) return;
+            _settings.RefreshSeconds = seconds;
+            _settings.Save();
         }
 
-        private async Task RefreshDashboardAsync(bool userInitiated)
+        private IList<string> ResolveRoots()
+        {
+            var roots = new List<string>();
+            foreach (var pinned in _settings.Sources)
+            {
+                if (!roots.Any(value => string.Equals(value, pinned, StringComparison.OrdinalIgnoreCase)))
+                {
+                    roots.Add(pinned);
+                }
+            }
+
+            if (_settings.AutoDetectSources)
+            {
+                foreach (var discovered in ClaudeDataLocator.Discover())
+                {
+                    if (!roots.Any(value => string.Equals(value, discovered.Path, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        roots.Add(discovered.Path);
+                    }
+                }
+            }
+
+            return roots;
+        }
+
+        private async Task RefreshAsync(bool userInitiated)
         {
             if (_refreshing)
             {
@@ -482,92 +601,50 @@ namespace ClaudeUsage.WinForms
 
             _refreshing = true;
             _refreshButton.Enabled = false;
-            _sourceStateLabel.Text = "REFRESHING";
-            _sourceStateLabel.BackColor = Palette.NeutralBadge;
-            _sourceStateLabel.ForeColor = Palette.Muted;
-            _statusLabel.Text = "Reading local Claude usage metadata…";
+            SetBadge("SCANNING", false);
+            _statusLabel.Text = "Reading local Claude Code transcripts…";
 
             try
             {
-                var path = _sourcePath;
-                var configDirectory = Path.GetDirectoryName(path);
-                var date = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-                DashboardLoadResult result;
-                var usePreviousHistory = !File.Exists(path) && _historyDocument != null;
-                try
+                _roots = ResolveRoots();
+                UpdateSourceLabel();
+                if (_roots.Count == 0)
                 {
-                    result = await Task.Run(() => LoadDashboard(
-                        path,
-                        configDirectory,
-                        date,
-                        _lifetimeCancellation.Token,
-                        usePreviousHistory));
-                    result.UsedPreviousHistory = usePreviousHistory;
-                }
-                catch (Exception error) when (!(error is OperationCanceledException) && _historyDocument != null)
-                {
-                    // A cache replacement can be briefly unreadable. Keep the last good
-                    // historical snapshot while still refreshing live current-day usage.
-                    result = await Task.Run(() => LoadDashboard(
-                        path,
-                        configDirectory,
-                        date,
-                        _lifetimeCancellation.Token,
-                        true));
-                    result.UsedPreviousHistory = true;
+                    ShowNoDataFound();
+                    return;
                 }
 
-                if (HasIncompleteLiveScan(result.LiveWarnings) &&
-                    _todaySnapshot != null &&
-                    string.Equals(_todaySnapshot.Date, date, StringComparison.Ordinal))
-                {
-                    result = new DashboardLoadResult(
-                        result.History,
-                        StatsCacheOverlay.ApplyToday(result.History, _todaySnapshot),
-                        _todaySnapshot,
-                        result.CacheWarnings,
-                        result.LiveWarnings,
-                        result.CacheWasLoaded,
-                        result.CacheReadAtUtc)
-                    {
-                        UsedPreviousHistory = result.UsedPreviousHistory,
-                        UsedPreviousToday = true
-                    };
-                }
-                _historyDocument = result.History;
-                _combinedDocument = result.Combined;
-                _todaySnapshot = result.Today;
-                UpdateDashboard(result);
-                var hasImportantWarning = result.CacheWarnings
-                    .Concat(result.LiveWarnings)
-                    .Any(value => value.Severity != WarningSeverity.Information);
-                var stale = result.UsedPreviousHistory || result.UsedPreviousToday;
-                _sourceStateLabel.Text = stale
-                    ? "LIVE · STALE SNAPSHOT"
-                    : (hasImportantWarning
-                        ? "LIVE · WARNING"
-                        : (result.CacheWasLoaded ? "LIVE" : "LIVE · NO CACHE"));
-                _sourceStateLabel.BackColor = stale || hasImportantWarning ? Palette.WarningBadge : Palette.SuccessBadge;
-                _sourceStateLabel.ForeColor = stale || hasImportantWarning ? Palette.WarningText : Palette.SuccessText;
+                var roots = _roots.ToList();
+                var progress = new Progress<TranscriptScanProgress>(OnScanProgress);
+                var result = await Task.Run(() => ScanWithRetry(roots, progress));
+
+                _history = result.History;
+                _report = result.Report;
+                _archivedOnlyDays = result.ArchivedOnlyDays;
+
+                UpdateModelFilter();
+                RenderToday();
+                ApplyPresetDates();
+                RenderRange();
+                UpdateStatus(result);
+                EvaluateAlerts();
             }
             catch (OperationCanceledException)
             {
-                // Closing the form cancels in-flight scanning.
+                // The window is closing.
             }
             catch (Exception error)
             {
-                _sourceStateLabel.Text = "NEEDS ATTENTION";
-                _sourceStateLabel.BackColor = Palette.WarningBadge;
-                _sourceStateLabel.ForeColor = Palette.WarningText;
+                SetBadge("NEEDS ATTENTION", true);
                 _statusLabel.Text = error.Message;
-                _todayNotice.Text = "Usage files could not be read. " + error.Message + " Choose the cache file or try Refresh now.";
-                _historyNotice.Text = "Historical data is unavailable. " + error.Message;
+                _todayNotice.Text = "Claude Code data could not be read. " + error.Message +
+                                    " No Claude files were changed. Try Refresh now, or pick a folder under Data sources.";
                 if (userInitiated)
                 {
                     MessageBox.Show(
                         this,
                         error.Message + "\r\n\r\nNo Claude files were changed.",
-                        "Could not refresh Claude Usage",
+                        "Could not read Claude Code data",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
                 }
@@ -579,184 +656,229 @@ namespace ClaudeUsage.WinForms
                 if (_refreshQueued && !IsDisposed)
                 {
                     _refreshQueued = false;
-                    BeginInvoke(new Action(async () => await RefreshDashboardAsync(false)));
+                    BeginInvoke(new Action(async () => await RefreshAsync(false)));
                 }
             }
         }
 
-        private DashboardLoadResult LoadDashboard(
-            string path,
-            string configDirectory,
-            string utcDate,
-            CancellationToken cancellationToken,
-            bool usePreviousHistory)
+        /// <summary>
+        /// A transcript being written mid-scan produces a transient warning. Retrying briefly
+        /// usually catches a settled file; the archive keeps the higher figure either way.
+        /// </summary>
+        private UsageRefreshResult ScanWithRetry(IList<string> roots, IProgress<TranscriptScanProgress> progress)
         {
-            StatsCacheDocument history;
-            IReadOnlyList<ParseWarning> cacheWarnings;
-            var cacheLoaded = File.Exists(path);
-            DateTime? cacheReadAt = null;
-            if (usePreviousHistory)
-            {
-                if (_historyDocument == null) throw new InvalidOperationException("No prior history is available.");
-                history = _historyDocument;
-                cacheWarnings = new List<ParseWarning>();
-                cacheLoaded = true;
-            }
-            else if (cacheLoaded)
-            {
-                var load = StatsFileLoader.LoadWithRetry(path);
-                history = load.Parsed.Document;
-                cacheWarnings = load.Parsed.Warnings;
-                cacheReadAt = load.ReadAtUtc;
-            }
-            else
-            {
-                var parsed = StatsCacheParser.Parse(EmptyCacheJson);
-                history = parsed.Document;
-                cacheWarnings = parsed.Warnings;
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            var today = CollectTodayWithRetry(configDirectory, utcDate, cancellationToken);
-            var combined = StatsCacheOverlay.ApplyToday(history, today);
-            return new DashboardLoadResult(
-                history,
-                combined,
-                today,
-                cacheWarnings,
-                today.Warnings,
-                cacheLoaded,
-                cacheReadAt);
-        }
-
-        private static TodayUsageSnapshot CollectTodayWithRetry(
-            string configDirectory,
-            string utcDate,
-            CancellationToken cancellationToken)
-        {
-            TodayUsageSnapshot snapshot = null;
-            var delays = new[] { 0, 100, 300 };
+            UsageRefreshResult result = null;
+            var delays = new[] { 0, 150, 400 };
             foreach (var delay in delays)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                _lifetime.Token.ThrowIfCancellationRequested();
                 if (delay > 0) Thread.Sleep(delay);
-                snapshot = TodayUsageCollector.Collect(configDirectory, utcDate, cancellationToken);
-                if (!HasIncompleteLiveScan(snapshot.Warnings)) return snapshot;
+                result = _store.Refresh(roots, TimeZoneInfo.Local, _lifetime.Token, progress);
+                if (result.Report.IsComplete) break;
             }
 
-            return snapshot;
+            _store.Save();
+            return result;
         }
 
-        private static bool HasIncompleteLiveScan(IEnumerable<ParseWarning> warnings)
+        private void OnScanProgress(TranscriptScanProgress progress)
         {
-            return warnings.Any(value => value.IsTransient);
+            if (IsDisposed || progress.TotalFiles == 0) return;
+            if (progress.FilesCompleted >= progress.TotalFiles) return;
+            _statusLabel.Text = "Reading transcripts… " +
+                progress.FilesCompleted.ToString("N0", CultureInfo.CurrentCulture) + " of " +
+                progress.TotalFiles.ToString("N0", CultureInfo.CurrentCulture);
         }
 
-        private void UpdateDashboard(DashboardLoadResult result)
+        private void ShowNoDataFound()
         {
-            RenderToday();
-            UpdateModelFilter();
-            ApplyPresetDates();
-            RenderHistory();
-            RenderAllTime();
+            SetBadge("NO DATA FOUND", true);
+            var distributions = ClaudeDataLocator.FindWslDistributions();
+            var hint = distributions.Count > 0
+                ? " WSL was detected (" + string.Join(", ", distributions.ToArray()) +
+                  "); if you run Claude Code there, add it from Data sources."
+                : string.Empty;
+            _statusLabel.Text = "No Claude Code data folder was found.";
+            _sourceLabel.Text = "No Claude Code data folder found";
+            _todayNotice.Text = "No Claude Code data folder was found automatically. " +
+                "Claude Usage looks in %USERPROFILE%\\.claude, %USERPROFILE%\\.config\\claude, and any folder named by " +
+                "CLAUDE_CONFIG_DIR, HOME, or HOMEDRIVE/HOMEPATH. Use Data sources to pick the folder that contains a " +
+                "\"projects\" subfolder." + hint;
+            _rangeNotice.Text = _todayNotice.Text;
+        }
 
-            var warnings = result.CacheWarnings.Count + result.LiveWarnings.Count;
-            var cacheText = result.UsedPreviousToday
-                ? "Live scan incomplete; last good Today snapshot retained"
-                : (result.UsedPreviousHistory
-                    ? "History cache unavailable; last good history retained"
-                    : (result.CacheWasLoaded
-                        ? "History cache loaded"
-                        : "History cache not found; showing live today data"));
-            _statusLabel.Text = cacheText + " · " + result.Today.FilesMatched.ToString("N0") +
-                                " matching transcript file(s) · " + warnings.ToString("N0") + " warning(s)";
-            var importantWarning = result.CacheWarnings
-                .Concat(result.LiveWarnings)
-                .FirstOrDefault(value => value.Severity != WarningSeverity.Information);
-            if (importantWarning != null)
+        private void UpdateSourceLabel()
+        {
+            if (_roots.Count == 0)
             {
-                _statusLabel.Text += " · " + importantWarning.Message;
+                _sourceLabel.Text = "No Claude Code data folder found";
+                return;
             }
+
+            var text = _roots[0];
+            if (_roots.Count > 1) text += "   (+" + (_roots.Count - 1) + " more)";
+            var missing = _roots.Where(root => !ClaudeDataLocator.HasProjects(root)).ToList();
+            if (missing.Count > 0) text += "   -   " + missing.Count + " unavailable";
+            _sourceLabel.Text = text;
+            _toolTip.SetToolTip(_sourceLabel, string.Join("\r\n", _roots.ToArray()));
+            _sourceLabel.AccessibleDescription = string.Join("; ", _roots.ToArray());
+        }
+
+        private void UpdateStatus(UsageRefreshResult result)
+        {
+            var warnings = result.Report.Warnings.Count;
+            var important = result.Report.Warnings.FirstOrDefault(value => value.Severity != WarningSeverity.Information);
+            SetBadge(important == null ? "LIVE" : "LIVE - WARNING", important != null);
+
+            var parts = new List<string>
+            {
+                result.Report.FilesSeen.ToString("N0", CultureInfo.CurrentCulture) + " transcript(s)",
+                result.Report.FilesParsed.ToString("N0", CultureInfo.CurrentCulture) + " read this pass",
+                _history.Days.Count.ToString("N0", CultureInfo.CurrentCulture) + " day(s) recorded"
+            };
+            if (_archivedOnlyDays > 0)
+            {
+                parts.Add(_archivedOnlyDays.ToString("N0", CultureInfo.CurrentCulture) + " day(s) from archive");
+            }
+
+            if (warnings > 0) parts.Add(warnings.ToString("N0", CultureInfo.CurrentCulture) + " warning(s)");
+            if (important != null) parts.Add(important.Message);
+            _statusLabel.Text = string.Join(" - ", parts.ToArray());
+
+            var span = _history.FirstDate == null
+                ? "no history yet"
+                : _history.FirstDate + " to " + _history.LastDate;
             _freshnessLabel.Text = "Refreshed " + DateTime.Now.ToString("t", CultureInfo.CurrentCulture) +
-                                   " · Cache through " + (result.History.LastComputedDate ?? "unknown");
+                                   " - history " + span;
 
-            if (result.UsedPreviousHistory)
+            if (_store.TimeZoneChanged)
             {
-                _historyNotice.Text = "The history cache is temporarily missing or unreadable. The last valid historical snapshot is still shown while live Today data continues to refresh.";
-            }
-
-            if (result.UsedPreviousToday)
-            {
-                _todayNotice.Text = "The latest transcript scan was incomplete, so the last valid Today snapshot remains visible. Automatic refresh will retry; no partial undercount was published.";
-            }
-            else if (result.CacheWasLoaded)
-            {
-                _historyNotice.Text = result.History.DailyTokensIncludeCache
-                    ? "Daily history includes input, output, cache read, and cache creation tokens. Activity is all-model even when a model filter is active. Cache computed through " + (result.History.LastComputedDate ?? "an unknown date") + "."
-                    : "This legacy cache stores input + output tokens only for historical days. Today uses all four token categories. Activity is all-model even when a model filter is active.";
-            }
-            else
-            {
-                _historyNotice.Text = "stats-cache.json was not found at the selected location. Today remains live, but historical slices will appear after Claude Code creates the cache (open /usage) or you choose another cache.";
+                _rangeNotice.Text = "This computer's time zone changed since the archive was created. Days recorded " +
+                                    "earlier keep their original local-day boundaries; current transcripts were re-read " +
+                                    "using the new one.";
             }
         }
 
         private void RenderToday()
         {
-            if (_todaySnapshot == null) return;
-            long input = 0;
-            long output = 0;
-            long cacheRead = 0;
-            long cacheCreate = 0;
-            foreach (var usage in _todaySnapshot.ModelUsage.Values)
-            {
-                input = SaturatingAdd(input, usage.InputTokens);
-                output = SaturatingAdd(output, usage.OutputTokens);
-                cacheRead = SaturatingAdd(cacheRead, usage.CacheReadInputTokens);
-                cacheCreate = SaturatingAdd(cacheCreate, usage.CacheCreationInputTokens);
-            }
-            var io = SaturatingAdd(input, output);
-            var processed = SaturatingAdd(SaturatingAdd(io, cacheRead), cacheCreate);
+            var today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            var day = _history.FindDay(today);
+            var tokens = day == null ? TokenTotals.Zero : day.Tokens;
 
-            _todayHeading.Text = "Today’s cumulative local usage · " + _todaySnapshot.Date + " UTC";
-            SetCard(_todayValues, "processed", processed);
-            SetCard(_todayValues, "input", input);
-            SetCard(_todayValues, "output", output);
-            SetCard(_todayValues, "cacheRead", cacheRead);
-            SetCard(_todayValues, "cacheCreate", cacheCreate);
-            SetCard(_todayValues, "io", io);
-            _todaySecondary.Text = "Sessions " + FormatExact(_todaySnapshot.Activity.SessionCount) +
-                                   "   ·   Messages " + FormatExact(_todaySnapshot.Activity.MessageCount) +
-                                   "   ·   Tool calls " + FormatExact(_todaySnapshot.Activity.ToolCallCount) +
-                                   "   ·   Files scanned " + FormatExact(_todaySnapshot.FilesScanned);
+            _todayHeading.Text = "Today - " + DateTime.Now.ToString("dddd, d MMMM yyyy", CultureInfo.CurrentCulture);
+            SetCard(_todayCards, "processed", tokens.ProcessedTokens);
+            SetCard(_todayCards, "input", tokens.InputTokens);
+            SetCard(_todayCards, "output", tokens.OutputTokens);
+            SetCard(_todayCards, "cacheRead", tokens.CacheReadTokens);
+            SetCard(_todayCards, "cacheCreate", tokens.CacheCreationTokens);
+            SetCard(_todayCards, "io", tokens.InputOutputTokens);
 
-            _todayNotice.Text = _todaySnapshot.FilesMatched == 0
-                ? "No qualifying Claude Code transcript activity was recorded on " + _todaySnapshot.Date + " UTC yet. This view refreshes automatically and stays entirely on this computer."
-                : "Live from " + _todaySnapshot.FilesMatched.ToString("N0") + " local transcript file(s). Processed = input + output + cache read + cache creation. Entries use their UTC date; session counts use their start date. This is not remaining plan quota.";
+            _todaySecondary.Text = "Responses " + Exact(day == null ? 0 : day.ResponseCount) +
+                                   "   -   Messages " + Exact(day == null ? 0 : day.MessageCount) +
+                                   "   -   Tool calls " + Exact(day == null ? 0 : day.ToolCallCount) +
+                                   "   -   Sessions " + Exact(day == null ? 0 : day.SessionCount);
+
+            _todayNotice.Text = day == null
+                ? "No Claude Code activity has been recorded today. This view refreshes on its own and never leaves this computer."
+                : "Live from Claude Code's session transcripts. Processed = input + output + cache read + cache creation. " +
+                  "Days are local calendar days. These are locally recorded token counts, not a bill or your remaining plan allowance.";
 
             _todayModelsGrid.Rows.Clear();
-            foreach (var usage in _todaySnapshot.ModelUsage.Values
-                         .OrderByDescending(value => ModelProcessed(value))
-                         .ThenBy(value => value.ModelId, StringComparer.Ordinal))
+            if (day != null)
             {
-                _todayModelsGrid.Rows.Add(
-                    usage.ModelId,
-                    usage.InputTokens,
-                    usage.OutputTokens,
-                    usage.CacheReadInputTokens,
-                    usage.CacheCreationInputTokens,
-                    ModelProcessed(usage));
+                foreach (var model in day.Models.Values
+                    .OrderByDescending(value => value.Tokens.ProcessedTokens)
+                    .ThenBy(value => value.ModelId, StringComparer.Ordinal))
+                {
+                    _todayModelsGrid.Rows.Add(
+                        model.ModelId,
+                        model.Tokens.InputTokens,
+                        model.Tokens.OutputTokens,
+                        model.Tokens.CacheReadTokens,
+                        model.Tokens.CacheCreationTokens,
+                        model.Tokens.ProcessedTokens,
+                        model.ResponseCount);
+                }
             }
+
+            RenderThreshold(tokens);
+        }
+
+        private void RenderThreshold(TokenTotals todayTokens)
+        {
+            var alerts = _settings.Alerts;
+            if (!alerts.IsActive)
+            {
+                _thresholdLabel.Text = "No daily threshold is set. Set one to be warned before a heavy day gets away from you.";
+                _thresholdLabel.ForeColor = Palette.Muted;
+                _thresholdBar.Visible = false;
+                _thresholdButton.Text = "Set threshold…";
+                return;
+            }
+
+            var evaluation = UsageAlertEvaluator.Evaluate(
+                alerts,
+                DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                todayTokens.Select(alerts.Metric),
+                _settings.NotifiedAlert);
+
+            _thresholdButton.Text = "Change threshold…";
+            _thresholdBar.Visible = true;
+            _thresholdBar.Value = Math.Max(0, Math.Min(100, evaluation.Percent));
+            _thresholdLabel.Text = evaluation.Message +
+                                   "   Warning at " + alerts.EffectiveWarnPercent.ToString(CultureInfo.CurrentCulture) + "%.";
+            _thresholdLabel.ForeColor = evaluation.Level == AlertLevel.Limit
+                ? Palette.DangerText
+                : (evaluation.Level == AlertLevel.Warning ? Palette.WarningText : Palette.Text);
+        }
+
+        private void EvaluateAlerts()
+        {
+            var alerts = _settings.Alerts;
+            if (!alerts.IsActive) return;
+
+            var today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            var day = _history.FindDay(today);
+            var tokens = day == null ? 0 : day.Tokens.Select(alerts.Metric);
+            var evaluation = UsageAlertEvaluator.Evaluate(alerts, today, tokens, _settings.NotifiedAlert);
+            if (!evaluation.ShouldNotify) return;
+
+            _settings.RecordNotifiedAlert(today, evaluation.Level);
+            _settings.Save();
+
+            if (_tray != null)
+            {
+                var wasVisible = _tray.Visible;
+                _tray.Visible = true;
+                _tray.ShowBalloonTip(
+                    15000,
+                    evaluation.Title,
+                    evaluation.Message,
+                    evaluation.Level == AlertLevel.Limit ? ToolTipIcon.Warning : ToolTipIcon.Info);
+                if (!wasVisible && WindowState != FormWindowState.Minimized)
+                {
+                    // Keep the icon around briefly so the balloon is not orphaned.
+                    var hide = new System.Windows.Forms.Timer { Interval = 20000 };
+                    hide.Tick += (sender, args) =>
+                    {
+                        hide.Stop();
+                        hide.Dispose();
+                        if (_tray != null && WindowState != FormWindowState.Minimized) _tray.Visible = false;
+                    };
+                    hide.Start();
+                }
+            }
+
+            _statusLabel.Text = evaluation.Title + " - " + evaluation.Message;
         }
 
         private void UpdateModelFilter()
         {
-            if (_combinedDocument == null) return;
             var previous = _modelFilter.SelectedItem as string;
             _updatingFilters = true;
             _modelFilter.Items.Clear();
             _modelFilter.Items.Add(AllModelsLabel);
-            foreach (var model in _combinedDocument.ModelIds) _modelFilter.Items.Add(model);
+            foreach (var model in _history.ModelIds) _modelFilter.Items.Add(model);
             var index = previous == null ? -1 : _modelFilter.Items.IndexOf(previous);
             _modelFilter.SelectedIndex = index >= 0 ? index : 0;
             _updatingFilters = false;
@@ -766,24 +888,70 @@ namespace ClaudeUsage.WinForms
         {
             if (_rangePreset == null || _fromDate == null || _toDate == null) return;
             var preset = _rangePreset.SelectedItem as string ?? "Last 30 days";
-            var today = DateTime.UtcNow.Date;
+            var today = DateTime.Now.Date;
             _updatingFilters = true;
-            _fromDate.Enabled = preset == "Custom";
-            _toDate.Enabled = preset == "Custom";
-            if (preset != "Custom")
+            var custom = preset == "Custom";
+            _fromDate.Enabled = custom;
+            _toDate.Enabled = custom;
+            if (!custom)
             {
-                _toDate.Value = today;
-                if (preset == "Today") _fromDate.Value = today;
-                else if (preset == "Last 7 days") _fromDate.Value = today.AddDays(-6);
-                else if (preset == "Last 30 days") _fromDate.Value = today.AddDays(-29);
-                else if (preset == "Last 90 days") _fromDate.Value = today.AddDays(-89);
-                else
+                var from = today;
+                var to = today;
+                switch (preset)
                 {
-                    var earliest = EarliestDate(_combinedDocument);
-                    _fromDate.Value = earliest ?? today;
+                    case "Today":
+                        break;
+                    case "Yesterday":
+                        from = today.AddDays(-1);
+                        to = from;
+                        break;
+                    case "Last 7 days":
+                        from = today.AddDays(-6);
+                        break;
+                    case "Last 30 days":
+                        from = today.AddDays(-29);
+                        break;
+                    case "Last 90 days":
+                        from = today.AddDays(-89);
+                        break;
+                    case "This month":
+                        from = new DateTime(today.Year, today.Month, 1);
+                        break;
+                    case "Last month":
+                        var firstOfThisMonth = new DateTime(today.Year, today.Month, 1);
+                        from = firstOfThisMonth.AddMonths(-1);
+                        to = firstOfThisMonth.AddDays(-1);
+                        break;
+                    default:
+                        from = EarliestRecordedDate() ?? today;
+                        break;
                 }
+
+                _fromDate.Value = ClampToPickerRange(from);
+                _toDate.Value = ClampToPickerRange(to);
             }
+
             _updatingFilters = false;
+        }
+
+        private static DateTime ClampToPickerRange(DateTime value)
+        {
+            if (value < DateTimePicker.MinimumDateTime) return DateTimePicker.MinimumDateTime;
+            if (value > DateTimePicker.MaximumDateTime) return DateTimePicker.MaximumDateTime;
+            return value;
+        }
+
+        private DateTime? EarliestRecordedDate()
+        {
+            DateTime parsed;
+            return _history.FirstDate != null && DateTime.TryParseExact(
+                _history.FirstDate,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out parsed)
+                ? parsed
+                : (DateTime?)null;
         }
 
         private void OnCustomDateChanged()
@@ -797,301 +965,470 @@ namespace ClaudeUsage.WinForms
                 _toDate.Enabled = true;
                 _updatingFilters = false;
             }
-            RenderHistory();
+
+            RenderRange();
         }
 
-        private void RenderHistory()
+        private void RenderRange()
         {
-            if (_combinedDocument == null || _rangePreset == null) return;
+            if (_rangePreset == null) return;
             try
             {
-                string from = null;
-                string to = null;
-                var preset = _rangePreset.SelectedItem as string;
-                if (preset != "All time")
+                var filter = CurrentFilter();
+                _rangeAnalytics = UsageAnalyticsCalculator.Calculate(_history, filter);
+                var analytics = _rangeAnalytics;
+
+                SetCard(_rangeCards, "processed", analytics.Tokens.ProcessedTokens);
+                SetCard(_rangeCards, "input", analytics.Tokens.InputTokens);
+                SetCard(_rangeCards, "output", analytics.Tokens.OutputTokens);
+                SetCard(_rangeCards, "cacheRead", analytics.Tokens.CacheReadTokens);
+                SetCard(_rangeCards, "cacheCreate", analytics.Tokens.CacheCreationTokens);
+                SetCard(_rangeCards, "io", analytics.Tokens.InputOutputTokens);
+
+                RenderChart(analytics);
+
+                _dailyGrid.Rows.Clear();
+                foreach (var day in analytics.Days.OrderByDescending(value => value.Date, StringComparer.Ordinal))
                 {
-                    from = _fromDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-                    to = _toDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-                }
-                if (from != null && string.CompareOrdinal(from, to) > 0)
-                {
-                    _historyNotice.Text = "The From date must be on or before the To date.";
-                    return;
+                    _dailyGrid.Rows.Add(
+                        day.Date,
+                        day.Tokens.InputTokens,
+                        day.Tokens.OutputTokens,
+                        day.Tokens.CacheReadTokens,
+                        day.Tokens.CacheCreationTokens,
+                        day.Tokens.ProcessedTokens,
+                        day.ResponseCount,
+                        day.ToolCallCount,
+                        day.SessionCount);
                 }
 
-                var selected = _modelFilter.SelectedItem as string;
-                IEnumerable<string> models = selected == null || selected == AllModelsLabel ? null : new[] { selected };
-                var analytics = UsageAnalyticsCalculator.Calculate(_combinedDocument, new UsageFilter(from, to, models));
-                SetCard(_historyValues, "tokens", analytics.TotalTokens);
-                SetCard(_historyValues, "messages", analytics.TotalMessages);
-                SetCard(_historyValues, "sessions", analytics.TotalSessions);
-                SetCard(_historyValues, "tools", analytics.TotalToolCalls);
-                SetCard(_historyValues, "days", analytics.ActiveDays);
-
-                RenderHistoryChart(analytics);
-                _historyGrid.Rows.Clear();
-                foreach (var day in analytics.DailyUsage.OrderByDescending(value => value.Date))
+                _modelsGrid.Rows.Clear();
+                foreach (var model in analytics.Models)
                 {
-                    _historyGrid.Rows.Add(day.Date, day.Tokens, day.MessageCount, day.SessionCount, day.ToolCallCount);
+                    _modelsGrid.Rows.Add(
+                        model.ModelId,
+                        model.Tokens.InputTokens,
+                        model.Tokens.OutputTokens,
+                        model.Tokens.CacheReadTokens,
+                        model.Tokens.CacheCreationTokens,
+                        model.Tokens.ProcessedTokens,
+                        model.ResponseCount,
+                        model.ToolCallCount,
+                        model.WebSearchRequests);
                 }
 
-                if (analytics.IsEmpty)
-                {
-                    _historyNotice.Text = "No usage matches this date and model selection. Activity remains all-model because stats-cache.json has no per-model activity dimension.";
-                }
-                else if (selected != null && selected != AllModelsLabel)
-                {
-                    _historyNotice.Text = (_combinedDocument.DailyTokensIncludeCache
-                            ? "Processed tokens"
-                            : "Legacy input + output tokens") +
-                        " are filtered to " + selected + ". Messages, sessions, and tool calls remain date-filtered totals for all models.";
-                }
-                else
-                {
-                    _historyNotice.Text = _combinedDocument.DailyTokensIncludeCache
-                        ? "Daily processed tokens and activity for the selected dates. Tokens include input, output, cache read, and cache creation; this is not remaining plan quota."
-                        : "Legacy daily input + output tokens and activity for the selected dates. The live Today view separately shows all four token categories.";
-                }
+                _rangeNotice.Text = RangeNoticeText(analytics);
+                _modelsNotice.Text = "Range " + RangeLabel() + " - " + ModelLabel() +
+                                     ". Message and session counts are not shown here because a session can span models.";
             }
             catch (ArgumentException error)
             {
-                _historyNotice.Text = error.Message;
+                _rangeNotice.Text = error.Message;
             }
         }
 
-        private void RenderHistoryChart(UsageAnalytics analytics)
+        private string RangeNoticeText(UsageAnalytics analytics)
         {
-            var series = _historyChart.Series[0];
+            if (_history.Days.Count == 0)
+            {
+                return "No usage has been recorded yet. Claude Usage builds history from Claude Code's session " +
+                       "transcripts as you work, and keeps its own daily archive so totals survive Claude Code's " +
+                       "transcript cleanup.";
+            }
+
+            if (analytics.IsEmpty)
+            {
+                return "Nothing matches this date and model selection. Recorded history covers " +
+                       _history.FirstDate + " to " + _history.LastDate + ".";
+            }
+
+            var text = "Processed tokens include input, output, cache read, and cache creation. ";
+            if (analytics.ActivityIsWholeDay)
+            {
+                text += "Tokens, responses, and tool calls are filtered to " + ModelLabel() +
+                        "; message and session counts remain whole-day totals. ";
+            }
+
+            if (_archivedOnlyDays > 0)
+            {
+                text += _archivedOnlyDays.ToString("N0", CultureInfo.CurrentCulture) +
+                        " earlier day(s) come from Claude Usage's own archive, because Claude Code has since deleted " +
+                        "those transcripts. ";
+            }
+
+            return text + "None of these figures is a bill or your remaining plan allowance.";
+        }
+
+        private UsageFilter CurrentFilter()
+        {
+            string from = null;
+            string to = null;
+            if ((_rangePreset.SelectedItem as string) != "All time")
+            {
+                from = _fromDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                to = _toDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                if (string.CompareOrdinal(from, to) > 0)
+                {
+                    throw new ArgumentException("The From date must be on or before the To date.");
+                }
+            }
+
+            var selected = _modelFilter.SelectedItem as string;
+            var models = selected == null || selected == AllModelsLabel ? null : new[] { selected };
+            return new UsageFilter(from, to, models);
+        }
+
+        private string RangeLabel()
+        {
+            var preset = _rangePreset.SelectedItem as string ?? "Custom";
+            if (preset == "All time")
+            {
+                return _history.FirstDate == null
+                    ? "All recorded dates"
+                    : "All recorded dates (" + _history.FirstDate + " to " + _history.LastDate + ")";
+            }
+
+            var from = _fromDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            var to = _toDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            return from == to ? from + " (" + preset + ")" : from + " to " + to + " (" + preset + ")";
+        }
+
+        private string ModelLabel()
+        {
+            var selected = _modelFilter.SelectedItem as string;
+            return string.IsNullOrEmpty(selected) ? AllModelsLabel : selected;
+        }
+
+        private void RenderChart(UsageAnalytics analytics)
+        {
+            var series = _dailyChart.Series[0];
             series.Points.Clear();
-            var byDate = analytics.DailyUsage.ToDictionary(value => value.Date, StringComparer.Ordinal);
-            var min = analytics.FromDate ?? (analytics.DailyUsage.Count == 0 ? null : analytics.DailyUsage.Min(value => value.Date));
-            var max = analytics.ToDate ?? (analytics.DailyUsage.Count == 0 ? null : analytics.DailyUsage.Max(value => value.Date));
+            var byDate = analytics.Days.ToDictionary(value => value.Date, StringComparer.Ordinal);
+            var min = analytics.FromDate ?? (analytics.Days.Count == 0 ? null : analytics.Days[0].Date);
+            var max = analytics.ToDate ??
+                      (analytics.Days.Count == 0 ? null : analytics.Days[analytics.Days.Count - 1].Date);
             if (min == null || max == null) return;
 
             DateTime cursor;
             DateTime last;
             if (!DateTime.TryParseExact(min, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out cursor) ||
-                !DateTime.TryParseExact(max, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out last)) return;
-            var maximumDays = 5000;
-            while (cursor <= last && maximumDays-- > 0)
-            {
-                var key = cursor.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-                DailyUsage day;
-                byDate.TryGetValue(key, out day);
-                var point = series.Points.Add(day == null ? 0D : day.Tokens);
-                point.AxisLabel = key;
-                point.ToolTip = key + ": " + FormatExact(day == null ? 0 : day.Tokens) +
-                                  (_combinedDocument.DailyTokensIncludeCache
-                                      ? " processed tokens"
-                                      : " input + output tokens");
-                cursor = cursor.AddDays(1);
-            }
-
-            var area = _historyChart.ChartAreas[0];
-            area.AxisX.Interval = Math.Max(1, Math.Ceiling(series.Points.Count / 10D));
-            area.RecalculateAxesScale();
-            _historyChart.AccessibleDescription = (_combinedDocument.DailyTokensIncludeCache
-                    ? "Processed tokens"
-                    : "Input plus output tokens") +
-                " over time. Exact values are available in the daily values table below.";
-        }
-
-        private void RenderAllTime()
-        {
-            if (_combinedDocument == null) return;
-            _allTimeGrid.Rows.Clear();
-            foreach (var usage in _combinedDocument.ModelUsage.Values
-                         .OrderByDescending(ModelProcessed)
-                         .ThenBy(value => value.ModelId, StringComparer.Ordinal))
-            {
-                var cost = usage.CostUsd.HasValue ? usage.CostUsd.Value.ToString("C2", CultureInfo.CurrentCulture) : "—";
-                _allTimeGrid.Rows.Add(
-                    usage.ModelId,
-                    usage.InputTokens,
-                    usage.OutputTokens,
-                    usage.CacheReadInputTokens,
-                    usage.CacheCreationInputTokens,
-                    ModelProcessed(usage),
-                    usage.WebSearchRequests,
-                    cost);
-            }
-        }
-
-        private void ChooseSource(object sender, EventArgs args)
-        {
-            using (var dialog = new OpenFileDialog
-            {
-                Title = "Choose Claude Code stats-cache.json",
-                Filter = "Claude stats cache (stats-cache.json)|stats-cache.json|JSON files (*.json)|*.json|All files (*.*)|*.*",
-                CheckFileExists = true,
-                Multiselect = false,
-                FileName = "stats-cache.json",
-                InitialDirectory = Directory.Exists(Path.GetDirectoryName(_sourcePath)) ? Path.GetDirectoryName(_sourcePath) : null
-            })
-            {
-                if (dialog.ShowDialog(this) != DialogResult.OK) return;
-                _sourcePath = Path.GetFullPath(dialog.FileName);
-                _sourceLabel.Text = _sourcePath;
-                _sourceLabel.AccessibleDescription = _sourcePath;
-                _toolTip.SetToolTip(_sourceLabel, _sourcePath);
-                _settings.WriteSourcePath(_sourcePath);
-                _historyDocument = null;
-                _combinedDocument = null;
-                _todaySnapshot = null;
-                SetupWatcher();
-                BeginInvoke(new Action(async () => await RefreshDashboardAsync(true)));
-            }
-        }
-
-        private void SetupWatcher()
-        {
-            DisposeWatcher(ref _cacheWatcher);
-            DisposeWatcher(ref _projectsWatcher);
-            try
-            {
-                var directory = Path.GetDirectoryName(_sourcePath);
-                if (!Directory.Exists(directory)) return;
-                // Watch only the selected cache and the creation of its sibling
-                // projects directory. Events for other top-level files are ignored.
-                _cacheWatcher = new FileSystemWatcher(directory, "*")
-                {
-                    IncludeSubdirectories = false,
-                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName |
-                                   NotifyFilters.LastWrite | NotifyFilters.Size,
-                    EnableRaisingEvents = true
-                };
-                AttachWatcher(_cacheWatcher);
-
-                var projectsDirectory = Path.Combine(directory, "projects");
-                if (Directory.Exists(projectsDirectory))
-                {
-                    _projectsWatcher = new FileSystemWatcher(projectsDirectory, "*.jsonl")
-                    {
-                        IncludeSubdirectories = true,
-                        InternalBufferSize = 32768,
-                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.DirectoryName,
-                        EnableRaisingEvents = true
-                    };
-                    AttachWatcher(_projectsWatcher);
-                }
-            }
-            catch
-            {
-                // The interval timer remains a reliable fallback for network/WSL paths.
-            }
-        }
-
-        private void AttachWatcher(FileSystemWatcher watcher)
-        {
-            watcher.Changed += OnUsageFileChanged;
-            watcher.Created += OnUsageFileChanged;
-            watcher.Deleted += OnUsageFileChanged;
-            watcher.Renamed += OnUsageFileChanged;
-            watcher.Error += OnWatcherError;
-        }
-
-        private static void DisposeWatcher(ref FileSystemWatcher watcher)
-        {
-            if (watcher == null) return;
-            watcher.EnableRaisingEvents = false;
-            watcher.Dispose();
-            watcher = null;
-        }
-
-        private void OnUsageFileChanged(object sender, FileSystemEventArgs args)
-        {
-            if (IsDisposed || Disposing) return;
-            if (ReferenceEquals(sender, _cacheWatcher))
-            {
-                try
-                {
-                    var changedPath = Path.GetFullPath(args.FullPath);
-                    var selectedCache = Path.GetFullPath(_sourcePath);
-                    var projectsDirectory = Path.GetFullPath(Path.Combine(
-                        Path.GetDirectoryName(_sourcePath),
-                        "projects"));
-                    if (string.Equals(changedPath, projectsDirectory, StringComparison.OrdinalIgnoreCase))
-                    {
-                        ScheduleWatcherRefresh(true);
-                        return;
-                    }
-                    if (!string.Equals(changedPath, selectedCache, StringComparison.OrdinalIgnoreCase)) return;
-                }
-                catch
-                {
-                    return;
-                }
-            }
-            else if (!IsAllowedTranscriptPath(args.FullPath))
+                !DateTime.TryParseExact(max, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out last))
             {
                 return;
             }
 
-            ScheduleWatcherRefresh(false);
+            var remaining = 3660;
+            while (cursor <= last && remaining-- > 0)
+            {
+                var key = cursor.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                DailyUsage day;
+                byDate.TryGetValue(key, out day);
+                var value = day == null ? 0L : day.Tokens.ProcessedTokens;
+                var point = series.Points.Add(value);
+                point.AxisLabel = key;
+                point.ToolTip = key + ": " + Exact(value) + " processed tokens";
+                if (_settings.Alerts.IsActive &&
+                    _settings.Alerts.Metric == TokenMetric.Processed &&
+                    value >= _settings.Alerts.DailyLimitTokens)
+                {
+                    point.Color = Palette.Orange;
+                }
+
+                cursor = cursor.AddDays(1);
+            }
+
+            var area = _dailyChart.ChartAreas[0];
+            area.AxisX.Interval = Math.Max(1, Math.Ceiling(series.Points.Count / 12D));
+            area.RecalculateAxesScale();
+            _dailyChart.AccessibleDescription =
+                "Processed tokens per day. Exact values are in the daily values table below.";
+        }
+
+        private void ExportPdf()
+        {
+            if (_rangeAnalytics == null)
+            {
+                MessageBox.Show(
+                    this,
+                    "There is nothing to export yet. Wait for the first scan to finish.",
+                    "Export PDF",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var suggested = "claude-usage-" +
+                (_rangeAnalytics.FromDate ?? _history.FirstDate ?? "all") + "-to-" +
+                (_rangeAnalytics.ToDate ?? _history.LastDate ?? "now") + ".pdf";
+            foreach (var invalid in Path.GetInvalidFileNameChars()) suggested = suggested.Replace(invalid, '-');
+
+            using (var dialog = new SaveFileDialog
+            {
+                Title = "Save usage report",
+                Filter = "PDF report (*.pdf)|*.pdf",
+                FileName = suggested,
+                DefaultExt = "pdf",
+                AddExtension = true,
+                OverwritePrompt = true,
+                InitialDirectory = Directory.Exists(_settings.ExportFolder)
+                    ? _settings.ExportFolder
+                    : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+            })
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    var options = new UsageReportOptions
+                    {
+                        Title = "Claude Code Usage Report",
+                        RangeLabel = RangeLabel(),
+                        ModelLabel = ModelLabel(),
+                        TimeZoneLabel = TimeZoneInfo.Local.IsDaylightSavingTime(DateTime.Now)
+                            ? TimeZoneInfo.Local.DaylightName
+                            : TimeZoneInfo.Local.StandardName,
+                        DataLocations = _roots.ToList(),
+                        Metric = _settings.Alerts.Metric,
+                        DailyThresholdTokens = _settings.Alerts.IsActive ? _settings.Alerts.DailyLimitTokens : 0,
+                        ArchivedOnlyDays = _archivedOnlyDays
+                    };
+                    UsageReportWriter.Write(dialog.FileName, _rangeAnalytics, options);
+                    _settings.ExportFolder = Path.GetDirectoryName(dialog.FileName);
+                    _settings.Save();
+
+                    var open = MessageBox.Show(
+                        this,
+                        "Saved " + Path.GetFileName(dialog.FileName) + ".\r\n\r\nOpen it now?",
+                        "Export PDF",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Information);
+                    if (open == DialogResult.Yes)
+                    {
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dialog.FileName)
+                        {
+                            UseShellExecute = true
+                        });
+                    }
+                }
+                catch (Exception error)
+                {
+                    MessageBox.Show(
+                        this,
+                        "The report could not be saved. " + error.Message,
+                        "Export PDF",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
+        }
+
+        private void EditSources()
+        {
+            using (var dialog = new SourcesDialog(_settings))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                _settings.Save();
+                if (dialog.RebuildRequested)
+                {
+                    _store.Clear();
+                    _history = UsageHistory.Empty;
+                }
+
+                SetupWatchers();
+                BeginInvoke(new Action(async () => await RefreshAsync(true)));
+            }
+        }
+
+        private void EditAlerts()
+        {
+            using (var dialog = new AlertsDialog(_settings.Alerts))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                _settings.ReplaceAlerts(dialog.Result);
+                _settings.RecordNotifiedAlert(null, AlertLevel.None);
+                _settings.Save();
+                RenderToday();
+                RenderRange();
+                EvaluateAlerts();
+            }
+        }
+
+        private void SetupWatchers()
+        {
+            foreach (var watcher in _watchers)
+            {
+                try
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Dispose();
+                }
+                catch
+                {
+                    // Already gone.
+                }
+            }
+
+            _watchers.Clear();
+            foreach (var root in ResolveRoots())
+            {
+                try
+                {
+                    var projects = Path.Combine(root, "projects");
+                    if (!Directory.Exists(projects)) continue;
+                    var watcher = new FileSystemWatcher(projects, "*.jsonl")
+                    {
+                        IncludeSubdirectories = true,
+                        InternalBufferSize = 32768,
+                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                        EnableRaisingEvents = true
+                    };
+                    watcher.Changed += OnTranscriptChanged;
+                    watcher.Created += OnTranscriptChanged;
+                    watcher.Deleted += OnTranscriptChanged;
+                    watcher.Renamed += OnTranscriptChanged;
+                    watcher.Error += OnWatcherError;
+                    _watchers.Add(watcher);
+                }
+                catch
+                {
+                    // Network and WSL paths may not support watching; the interval timer covers them.
+                }
+            }
+        }
+
+        private void OnTranscriptChanged(object sender, FileSystemEventArgs args)
+        {
+            ScheduleWatchRefresh(false);
         }
 
         private void OnWatcherError(object sender, ErrorEventArgs args)
         {
-            if (IsDisposed || Disposing) return;
-            ScheduleWatcherRefresh(true);
+            ScheduleWatchRefresh(true);
         }
 
-        private void ScheduleWatcherRefresh(bool recreateWatchers)
+        private void ScheduleWatchRefresh(bool recreateWatchers)
         {
+            if (IsDisposed || Disposing) return;
             try
             {
                 BeginInvoke(new Action(() =>
                 {
-                    if (recreateWatchers) SetupWatcher();
-                    _watchDebounceTimer.Stop();
-                    _watchDebounceTimer.Start();
+                    if (recreateWatchers) SetupWatchers();
+                    _watchDebounce.Stop();
+                    _watchDebounce.Start();
                 }));
             }
             catch
             {
-                // The window may be closing.
+                // The window is closing.
             }
         }
 
-        private bool IsAllowedTranscriptPath(string fullPath)
+        private void OnResize(object sender, EventArgs args)
         {
-            if (!string.Equals(Path.GetExtension(fullPath), ".jsonl", StringComparison.OrdinalIgnoreCase))
-                return false;
+            // Only take over the taskbar button when there is actually a threshold to watch;
+            // otherwise minimising should behave like any other window.
+            if (!_settings.MinimizeToTray || !_settings.Alerts.IsActive || _tray == null) return;
+            if (WindowState == FormWindowState.Minimized)
+            {
+                _tray.Visible = true;
+                Hide();
+            }
+        }
 
-            var configDirectory = Path.GetDirectoryName(_sourcePath);
-            var projectsDirectory = Path.Combine(configDirectory, "projects");
-            var prefix = projectsDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-                         Path.DirectorySeparatorChar;
-            var normalized = Path.GetFullPath(fullPath);
-            if (!normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
-
-            var relative = normalized.Substring(prefix.Length);
-            var segments = relative.Split(
-                new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
-                StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Length == 2) return true;
-            return segments.Length == 4 &&
-                   string.Equals(segments[2], "subagents", StringComparison.OrdinalIgnoreCase) &&
-                   segments[3].StartsWith("agent-", StringComparison.OrdinalIgnoreCase);
+        private void RestoreFromTray()
+        {
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Activate();
+            if (_tray != null) _tray.Visible = false;
         }
 
         private void OnFormClosing(object sender, FormClosingEventArgs args)
         {
+            if (!_exiting && args.CloseReason == CloseReason.UserClosing && _settings.Alerts.IsActive &&
+                _settings.MinimizeToTray && _tray != null && !_tray.Visible)
+            {
+                // A threshold can only be watched while the app runs, so closing the window keeps
+                // it in the notification area instead of stopping the watch silently.
+                args.Cancel = true;
+                _tray.Visible = true;
+                WindowState = FormWindowState.Minimized;
+                Hide();
+                _tray.ShowBalloonTip(
+                    4000,
+                    "Claude Usage is still watching",
+                    "Your daily threshold is still being monitored. Right-click this icon to exit.",
+                    ToolTipIcon.Info);
+                return;
+            }
+
             _refreshTimer.Stop();
-            _watchDebounceTimer.Stop();
-            _lifetimeCancellation.Cancel();
-            DisposeWatcher(ref _cacheWatcher);
-            DisposeWatcher(ref _projectsWatcher);
+            _watchDebounce.Stop();
+            _lifetime.Cancel();
+            foreach (var watcher in _watchers)
+            {
+                try
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Dispose();
+                }
+                catch
+                {
+                    // Already gone.
+                }
+            }
+
+            _watchers.Clear();
+            if (!_refreshing) _store.Save();
+            _settings.Save();
+            if (_tray != null)
+            {
+                _tray.Visible = false;
+                _tray.Dispose();
+                _tray = null;
+            }
+
+            if (_appIcon != null)
+            {
+                AppIcon.Release(_appIcon);
+                _appIcon = null;
+            }
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (keyData == Keys.F5)
             {
-                BeginInvoke(new Action(async () => await RefreshDashboardAsync(true)));
+                BeginInvoke(new Action(async () => await RefreshAsync(true)));
                 return true;
             }
+
+            if (keyData == (Keys.Control | Keys.E))
+            {
+                ExportPdf();
+                return true;
+            }
+
             return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private void SetBadge(string text, bool warning)
+        {
+            _stateBadge.Text = text;
+            _stateBadge.BackColor = warning ? Palette.WarningBadge : Palette.SuccessBadge;
+            _stateBadge.ForeColor = warning ? Palette.WarningText : Palette.SuccessText;
+        }
+
+        private Button HeaderButton(string text, string description)
+        {
+            return new Button
+            {
+                Text = text,
+                AutoSize = true,
+                FlatStyle = FlatStyle.System,
+                Margin = new Padding(8, 3, 0, 0),
+                AccessibleDescription = description
+            };
         }
 
         private static TabPage NewTab(string text)
@@ -1115,6 +1452,7 @@ namespace ClaudeUsage.WinForms
             {
                 stack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             }
+
             return stack;
         }
 
@@ -1124,7 +1462,7 @@ namespace ClaudeUsage.WinForms
             {
                 Text = text,
                 AutoSize = true,
-                Font = new Font("Segoe UI Semibold", 16F, FontStyle.Bold, GraphicsUnit.Point),
+                Font = new Font("Segoe UI Semibold", 15F, FontStyle.Bold, GraphicsUnit.Point),
                 ForeColor = Palette.Heading,
                 Margin = new Padding(0, 3, 0, 5)
             };
@@ -1148,7 +1486,7 @@ namespace ClaudeUsage.WinForms
             {
                 Text = text,
                 AutoSize = true,
-                MaximumSize = new Size(1060, 0),
+                MaximumSize = new Size(1080, 0),
                 ForeColor = Palette.Muted,
                 BackColor = Palette.InfoBackground,
                 Padding = new Padding(10, 8, 10, 8),
@@ -1166,13 +1504,16 @@ namespace ClaudeUsage.WinForms
                 ColumnCount = 1,
                 BackColor = Palette.Card,
                 Padding = new Padding(13, 10, 13, 10),
-                Margin = new Padding(0, 0, 9, 0),
+                Margin = new Padding(0, 0, 9, 9),
                 AccessibleName = title
             };
             card.RowStyles.Add(new RowStyle(SizeType.Absolute, 3));
             card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            card.Controls.Add(new Panel { Height = 3, Dock = DockStyle.Fill, BackColor = accent, Margin = new Padding(0) }, 0, 0);
+            card.Controls.Add(
+                new Panel { Height = 3, Dock = DockStyle.Fill, BackColor = accent, Margin = new Padding(0) },
+                0,
+                0);
             card.Controls.Add(new Label
             {
                 Text = title,
@@ -1213,7 +1554,7 @@ namespace ClaudeUsage.WinForms
                 GridColor = Palette.Border,
                 EnableHeadersVisualStyles = SystemInformation.HighContrast,
                 ColumnHeadersHeight = 36,
-                RowTemplate = { Height = 31 },
+                RowTemplate = { Height = 30 },
                 AccessibleName = accessibleName,
                 Margin = new Padding(0, 0, 0, 8)
             };
@@ -1235,7 +1576,7 @@ namespace ClaudeUsage.WinForms
             grid.Columns.Add(new DataGridViewTextBoxColumn
             {
                 HeaderText = title,
-                Width = 125,
+                Width = 112,
                 AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
                 DefaultCellStyle = new DataGridViewCellStyle
                 {
@@ -1246,36 +1587,32 @@ namespace ClaudeUsage.WinForms
             });
         }
 
-        private static Chart BuildHistoryChart()
+        private static Chart BuildChart()
         {
             var chart = new Chart
             {
                 Dock = DockStyle.Top,
-                Height = 285,
+                Height = 270,
                 BackColor = Palette.Card,
                 BorderlineColor = Palette.Border,
                 BorderlineDashStyle = ChartDashStyle.Solid,
-                Margin = new Padding(0, 0, 0, 10),
-                AccessibleName = "Historical tokens over time chart",
+                Margin = new Padding(0, 4, 0, 10),
+                AccessibleName = "Processed tokens per day",
                 Palette = ChartColorPalette.None
             };
-            var area = new ChartArea("Usage")
-            {
-                BackColor = Palette.Card
-            };
+            var area = new ChartArea("Usage") { BackColor = Palette.Card };
             area.AxisX.MajorGrid.Enabled = false;
             area.AxisX.LabelStyle.Angle = -45;
             area.AxisX.LabelStyle.ForeColor = Palette.Muted;
             area.AxisY.LabelStyle.ForeColor = Palette.Muted;
             area.AxisY.MajorGrid.LineColor = Palette.Border;
-            area.AxisY.Title = "Tokens";
+            area.AxisY.Title = "Processed tokens";
             area.AxisY.TitleForeColor = Palette.Muted;
             chart.ChartAreas.Add(area);
-            chart.Series.Add(new Series("Historical tokens")
+            chart.Series.Add(new Series("Processed tokens")
             {
                 ChartType = SeriesChartType.Column,
                 Color = Palette.Teal,
-                IsValueShownAsLabel = false,
                 XValueType = ChartValueType.String,
                 YValueType = ChartValueType.Int64
             });
@@ -1309,12 +1646,12 @@ namespace ClaudeUsage.WinForms
         {
             Label label;
             if (!values.TryGetValue(key, out label)) return;
-            label.Text = FormatCompact(value);
-            label.AccessibleDescription = FormatExact(value);
-            _toolTip.SetToolTip(label, FormatExact(value));
+            label.Text = Compact(value);
+            label.AccessibleDescription = Exact(value);
+            _toolTip.SetToolTip(label, Exact(value));
         }
 
-        private static string FormatCompact(long value)
+        private static string Compact(long value)
         {
             if (value >= 1000000000L) return (value / 1000000000D).ToString("0.##", CultureInfo.CurrentCulture) + "B";
             if (value >= 1000000L) return (value / 1000000D).ToString("0.##", CultureInfo.CurrentCulture) + "M";
@@ -1322,101 +1659,70 @@ namespace ClaudeUsage.WinForms
             return value.ToString("N0", CultureInfo.CurrentCulture);
         }
 
-        private static string FormatExact(long value)
+        private static string Exact(long value)
         {
             return value.ToString("N0", CultureInfo.CurrentCulture);
         }
 
-        private static long ModelProcessed(ModelUsage usage)
-        {
-            return SaturatingAdd(
-                SaturatingAdd(usage.InputTokens, usage.OutputTokens),
-                SaturatingAdd(usage.CacheReadInputTokens, usage.CacheCreationInputTokens));
-        }
-
-        private static long SaturatingAdd(long left, long right)
-        {
-            return long.MaxValue - left < right ? long.MaxValue : left + right;
-        }
-
-        private static DateTime? EarliestDate(StatsCacheDocument document)
-        {
-            if (document == null) return null;
-            var keys = document.DailyActivity.Select(value => value.Date)
-                .Concat(document.DailyModelTokens.Select(value => value.Date))
-                .OrderBy(value => value, StringComparer.Ordinal)
-                .ToList();
-            DateTime parsed;
-            return keys.Count > 0 && DateTime.TryParseExact(keys[0], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed)
-                ? parsed
-                : (DateTime?)null;
-        }
-
         private sealed class RefreshChoice
         {
-            public RefreshChoice(string label, int seconds)
+            internal RefreshChoice(string label, int seconds)
             {
                 Label = label;
                 Seconds = seconds;
             }
 
-            public string Label { get; private set; }
-            public int Seconds { get; private set; }
-            public override string ToString() { return Label; }
-        }
+            internal string Label { get; }
 
-        private sealed class DashboardLoadResult
-        {
-            public DashboardLoadResult(
-                StatsCacheDocument history,
-                StatsCacheDocument combined,
-                TodayUsageSnapshot today,
-                IReadOnlyList<ParseWarning> cacheWarnings,
-                IReadOnlyList<ParseWarning> liveWarnings,
-                bool cacheWasLoaded,
-                DateTime? cacheReadAtUtc)
+            internal int Seconds { get; }
+
+            public override string ToString()
             {
-                History = history;
-                Combined = combined;
-                Today = today;
-                CacheWarnings = cacheWarnings;
-                LiveWarnings = liveWarnings;
-                CacheWasLoaded = cacheWasLoaded;
-                CacheReadAtUtc = cacheReadAtUtc;
+                return Label;
             }
-
-            public StatsCacheDocument History { get; private set; }
-            public StatsCacheDocument Combined { get; private set; }
-            public TodayUsageSnapshot Today { get; private set; }
-            public IReadOnlyList<ParseWarning> CacheWarnings { get; private set; }
-            public IReadOnlyList<ParseWarning> LiveWarnings { get; private set; }
-            public bool CacheWasLoaded { get; private set; }
-            public DateTime? CacheReadAtUtc { get; private set; }
-            public bool UsedPreviousHistory { get; set; }
-            public bool UsedPreviousToday { get; set; }
         }
 
-        private static class Palette
+        internal static class Palette
         {
             private static readonly bool HighContrast = SystemInformation.HighContrast;
-            public static Color Window { get { return HighContrast ? SystemColors.Window : Color.FromArgb(246, 248, 251); } }
-            public static Color Card { get { return HighContrast ? SystemColors.Control : Color.White; } }
-            public static Color Text { get { return HighContrast ? SystemColors.WindowText : Color.FromArgb(38, 46, 57); } }
-            public static Color Heading { get { return HighContrast ? SystemColors.WindowText : Color.FromArgb(22, 31, 43); } }
-            public static Color Muted { get { return HighContrast ? SystemColors.GrayText : Color.FromArgb(88, 101, 117); } }
-            public static Color Border { get { return HighContrast ? SystemColors.ControlDark : Color.FromArgb(220, 226, 234); } }
-            public static Color InfoBackground { get { return HighContrast ? SystemColors.Info : Color.FromArgb(235, 242, 249); } }
-            public static Color NeutralBadge { get { return HighContrast ? SystemColors.Control : Color.FromArgb(230, 234, 239); } }
-            public static Color SuccessBadge { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(219, 241, 232); } }
-            public static Color SuccessText { get { return HighContrast ? SystemColors.HighlightText : Color.FromArgb(18, 104, 75); } }
-            public static Color WarningBadge { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(255, 235, 205); } }
-            public static Color WarningText { get { return HighContrast ? SystemColors.HighlightText : Color.FromArgb(143, 74, 13); } }
-            public static Color Accent { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(63, 81, 181); } }
-            public static Color Blue { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(45, 108, 223); } }
-            public static Color Green { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(41, 142, 104); } }
-            public static Color Purple { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(126, 87, 194); } }
-            public static Color Orange { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(223, 123, 47); } }
-            public static Color Teal { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(24, 142, 151); } }
+
+            internal static Color Window { get { return HighContrast ? SystemColors.Window : Color.FromArgb(246, 248, 251); } }
+
+            internal static Color Card { get { return HighContrast ? SystemColors.Control : Color.White; } }
+
+            internal static Color Text { get { return HighContrast ? SystemColors.WindowText : Color.FromArgb(38, 46, 57); } }
+
+            internal static Color Heading { get { return HighContrast ? SystemColors.WindowText : Color.FromArgb(22, 31, 43); } }
+
+            internal static Color Muted { get { return HighContrast ? SystemColors.GrayText : Color.FromArgb(88, 101, 117); } }
+
+            internal static Color Border { get { return HighContrast ? SystemColors.ControlDark : Color.FromArgb(220, 226, 234); } }
+
+            internal static Color InfoBackground { get { return HighContrast ? SystemColors.Info : Color.FromArgb(235, 242, 249); } }
+
+            internal static Color NeutralBadge { get { return HighContrast ? SystemColors.Control : Color.FromArgb(230, 234, 239); } }
+
+            internal static Color SuccessBadge { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(219, 241, 232); } }
+
+            internal static Color SuccessText { get { return HighContrast ? SystemColors.HighlightText : Color.FromArgb(18, 104, 75); } }
+
+            internal static Color WarningBadge { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(255, 235, 205); } }
+
+            internal static Color WarningText { get { return HighContrast ? SystemColors.HighlightText : Color.FromArgb(143, 74, 13); } }
+
+            internal static Color DangerText { get { return HighContrast ? SystemColors.HighlightText : Color.FromArgb(163, 45, 32); } }
+
+            internal static Color Accent { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(24, 122, 154); } }
+
+            internal static Color Blue { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(45, 108, 223); } }
+
+            internal static Color Green { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(41, 142, 104); } }
+
+            internal static Color Purple { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(126, 87, 194); } }
+
+            internal static Color Orange { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(223, 123, 47); } }
+
+            internal static Color Teal { get { return HighContrast ? SystemColors.Highlight : Color.FromArgb(24, 142, 151); } }
         }
     }
 }
