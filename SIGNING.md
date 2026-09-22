@@ -27,11 +27,15 @@ identities stop publication. Branch and pull-request builds remain unsigned deve
    | Field | Value |
    | --- | --- |
    | Issuer | `https://token.actions.githubusercontent.com` |
-   | Subject | `repo:p-m-sousa/Claudeometer:ref:refs/tags/v0.2.4` |
+   | Subject | `repo:p-m-sousa@285088775/Claudeometer@1332364334:ref:refs/tags/v0.2.4` |
    | Audience | `api://AzureADTokenExchange` |
 
-   In the GitHub federated-credential form, choose repository `p-m-sousa/Claudeometer`,
-   entity type **Tag**, and tag **v0.2.4**. This exact subject deliberately excludes branch
+   In the GitHub federated-credential form, use organization/owner `p-m-sousa` with ID
+   `285088775`, repository `Claudeometer` with ID `1332364334`, entity type **Tag**, and tag
+   **v0.2.4**. GitHub's repository OIDC settings confirm `use_immutable_subject: true` and
+   the subject prefix `repo:p-m-sousa@285088775/Claudeometer@1332364334`; the name-only
+   subject will not match. These IDs identify GitHub resources, not the Azure tenant or app.
+   This exact subject deliberately excludes branch
    and pull-request builds. Add a new exact-tag credential before each future release;
    remove credentials for old tags when rerunning those releases is no longer needed.
 
