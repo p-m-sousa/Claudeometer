@@ -120,6 +120,51 @@ messages 2, sessions 1.
 - [ ] The chart covers the whole selected span, including zero days, and the daily table matches it.
 - [ ] **Reset** returns to Last 30 days and All models.
 
+## Model pricing and spend
+
+- [ ] The estimates disclaimer remains visible below every tab, states that estimates use CLI
+      session data and configured prices, and directs users to Gemini Enterprise Agent Platform
+      for actual spend. It wraps without clipping on narrow windows and at larger text sizes.
+
+- [ ] **Pricing…** is visible beside Auto-refresh. It opens a list of configured models, with
+      Add model, Edit model, Delete model, Save, and Cancel controls accessible by keyboard.
+- [ ] On a fresh profile the list is empty. Token usage remains visible; used categories show
+      **Not configured** instead of a zero-dollar estimate.
+- [ ] Add `claude-opus-5` from the discovered-model list with no effective date. Enter synthetic
+      USD/1M rates: input **1**, output **2**, cache write **4**, cache read **3**. These are test
+      prices, not provider rates. Save model, then Save the pricing screen.
+- [ ] Today's Opus row shows input **$0.00011**, output **$0.00044**, cache read **$0.00099**,
+      cache write **$0.00176**, processed **$0.0033**. Its token counts remain unchanged.
+- [ ] Sonnet remains **Not configured**. Today's processed card shows **USD $0.0033 (partial)**;
+      its tooltip reports **1,100 priced tokens**, **26 unpriced tokens**, and exact spend.
+- [ ] Add `claude-sonnet-5` with the same undated rates. Today's category totals are **$0.000115**,
+      **$0.000452**, **$0.001011**, and **$0.001792**; processed is **$0.00337**, without partial.
+- [ ] Today's History daily row and Today cards show matching spend. Models uses the History range
+      and filter, and shows category spend below each token count. Sorting remains numeric by tokens.
+- [ ] Edit Opus and **Add period**, effective today, with rates **2**, **4**, **8**, **6**. Yesterday's
+      Opus spend stays **$0.03**; today's becomes **$0.0066**. All-time total is **$0.03667** in the
+      tooltip (displayed as **$0.04**). The new date is inclusive and the next day uses the same rates.
+- [ ] A future effective date does not change today's spend. Deleting a dated period restores the
+      preceding applicable rate. Duplicate dates or duplicate undated baselines are rejected.
+- [ ] Delete Opus's baseline while keeping today's period. Yesterday becomes **Not configured**;
+      today's estimate remains priced. Re-add a baseline and historical estimates return.
+- [ ] Editing only an undated baseline recalculates prior usage, including archive-only days;
+      explicit dated rates continue to apply. No token count changes.
+- [ ] Manual model identifiers can be entered before any usage is discovered. Duplicate model IDs,
+      empty identifiers, negative prices, and rates outside the supported range are prevented.
+- [ ] Explicit zero prices show zero spend, not Not configured. Tiny rates retain precision in
+      tooltips. USD formatting stays consistent when Windows uses a comma decimal separator.
+- [ ] Cancel in the model editor discards its edits; Cancel in the pricing screen discards all
+      pending model additions, edits, and deletions. Restart preserves only saved changes.
+- [ ] Delete model removes all of its rates after Save, retains its token history, and updates spend
+      coverage immediately in every view.
+- [ ] With `pricing.xml` unwritable, Save reports the error and keeps the draft open. Existing pricing
+      remains usable. A malformed pricing file produces a startup warning and is not overwritten.
+- [ ] Both pricing dialogs remain usable at 100%, 150%, and 200% scaling, with larger system text,
+      high contrast, a short display, and keyboard-only navigation. Save and Cancel stay reachable.
+- [ ] Spend text is fully visible in cards and cells at each scale. Tables scroll horizontally on
+      narrow windows; token and spend values stay together, and tooltips expose exact values.
+
 ## PDF export
 
 - [ ] **Export PDF…** and Ctrl+E both open a Save dialog under Documents with a dated filename.

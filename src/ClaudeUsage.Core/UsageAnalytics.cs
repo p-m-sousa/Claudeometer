@@ -53,8 +53,10 @@ namespace ClaudeUsage.Core
             long responseCount,
             long toolCallCount,
             long messageCount,
-            long sessionCount)
+            long sessionCount,
+            SpendTotals spend)
         {
+            Spend = spend;
             Date = date;
             Tokens = tokens;
             ResponseCount = responseCount;
@@ -66,6 +68,8 @@ namespace ClaudeUsage.Core
         public string Date { get; }
 
         public TokenTotals Tokens { get; }
+
+        public SpendTotals Spend { get; }
 
         public long ResponseCount { get; }
 
@@ -90,8 +94,10 @@ namespace ClaudeUsage.Core
             TokenTotals tokens,
             long responseCount,
             long toolCallCount,
-            long webSearchRequests)
+            long webSearchRequests,
+            SpendTotals spend)
         {
+            Spend = spend;
             ModelId = modelId;
             Tokens = tokens;
             ResponseCount = responseCount;
@@ -102,6 +108,8 @@ namespace ClaudeUsage.Core
         public string ModelId { get; }
 
         public TokenTotals Tokens { get; }
+
+        public SpendTotals Spend { get; }
 
         public long ResponseCount { get; }
 
@@ -124,8 +132,10 @@ namespace ClaudeUsage.Core
             IList<string> selectedModels,
             bool includesAllModels,
             string fromDate,
-            string toDate)
+            string toDate,
+            SpendTotals spend)
         {
+            Spend = spend;
             IncludesAllModels = includesAllModels;
             Days = new ReadOnlyCollection<DailyUsage>(days.ToList());
             Models = new ReadOnlyCollection<ModelTotal>(models.ToList());
@@ -148,6 +158,8 @@ namespace ClaudeUsage.Core
         public IReadOnlyList<ModelTotal> Models { get; }
 
         public TokenTotals Tokens { get; }
+
+        public SpendTotals Spend { get; }
 
         public long TotalResponses { get; }
 
@@ -203,10 +215,11 @@ namespace ClaudeUsage.Core
 
     public static class UsageAnalyticsCalculator
     {
-        public static UsageAnalytics Calculate(UsageHistory history, UsageFilter filter)
+        public static UsageAnalytics Calculate(UsageHistory history, UsageFilter filter, PricingCatalog pricing = null)
         {
             if (history == null) throw new ArgumentNullException(nameof(history));
             filter = filter ?? new UsageFilter();
+            pricing = pricing ?? PricingCatalog.Empty;
 
             var selected = filter.IncludesAllModels
                 ? new HashSet<string>(history.ModelIds, StringComparer.Ordinal)
@@ -215,6 +228,8 @@ namespace ClaudeUsage.Core
             var days = new List<DailyUsage>();
             var modelTotals = new Dictionary<string, ModelBuilder>(StringComparer.Ordinal);
             var tokens = TokenTotals.Zero;
+            var spend = SpendTotals.Zero;
+            var modelSpend = new Dictionary<string, SpendTotals>(StringComparer.Ordinal);
             long totalResponses = 0;
             long totalToolCalls = 0;
             long totalMessages = 0;
@@ -225,12 +240,18 @@ namespace ClaudeUsage.Core
                 if (!DateKey.IsWithinInclusiveRange(day.Date, filter.FromDate, filter.ToDate)) continue;
 
                 var dayTokens = TokenTotals.Zero;
+                var daySpend = SpendTotals.Zero;
                 long dayResponses = 0;
                 long dayToolCalls = 0;
                 foreach (var pair in day.Models)
                 {
                     if (!selected.Contains(pair.Key)) continue;
                     var model = pair.Value;
+                    var cost = pricing.Calculate(pair.Key, day.Date, model.Tokens);
+                    daySpend = daySpend.Add(cost);
+                    SpendTotals previousSpend;
+                    modelSpend[pair.Key] = modelSpend.TryGetValue(pair.Key, out previousSpend)
+                        ? previousSpend.Add(cost) : cost;
                     dayTokens = dayTokens.Add(model.Tokens);
                     dayResponses = Numbers.Add(dayResponses, model.ResponseCount);
                     dayToolCalls = Numbers.Add(dayToolCalls, model.ToolCallCount);
@@ -252,6 +273,7 @@ namespace ClaudeUsage.Core
                 }
 
                 tokens = tokens.Add(dayTokens);
+                spend = spend.Add(daySpend);
                 totalResponses = Numbers.Add(totalResponses, dayResponses);
                 totalToolCalls = Numbers.Add(totalToolCalls, dayToolCalls);
                 totalMessages = Numbers.Add(totalMessages, day.MessageCount);
@@ -263,7 +285,8 @@ namespace ClaudeUsage.Core
                     dayResponses,
                     dayToolCalls,
                     day.MessageCount,
-                    day.SessionCount));
+                    day.SessionCount,
+                    daySpend));
             }
 
             var models = modelTotals.Values
@@ -274,7 +297,8 @@ namespace ClaudeUsage.Core
                     model.Tokens,
                     model.ResponseCount,
                     model.ToolCallCount,
-                    model.WebSearchRequests))
+                    model.WebSearchRequests,
+                    modelSpend[model.ModelId]))
                 .OrderByDescending(model => model.Tokens.ProcessedTokens)
                 .ThenBy(model => model.ModelId, StringComparer.Ordinal)
                 .ToList();
@@ -291,7 +315,8 @@ namespace ClaudeUsage.Core
                 selected.OrderBy(value => value, StringComparer.Ordinal).ToList(),
                 filter.IncludesAllModels,
                 filter.FromDate,
-                filter.ToDate);
+                filter.ToDate,
+                spend);
         }
     }
 }

@@ -70,6 +70,23 @@ namespace ClaudeUsage.WinForms
                 Check(second.Report.FilesSeen == 0, "the deleted transcript is no longer read", output);
                 Check(second.ArchivedOnlyDays == 2, "days with no transcript are reported as archived", output);
 
+                var pricingPath = Path.Combine(scratch, "pricing.xml");
+                PricingStore.Save(pricingPath, new PricingCatalog(new[]
+                {
+                    new ModelPrice("claude-opus-5", null, 1, 2, 4, 3)
+                }));
+                // Exercise replacement as well as first-run creation under the shipped framework.
+                PricingStore.Save(pricingPath, new PricingCatalog(new[]
+                {
+                    new ModelPrice("claude-opus-5", null, 1, 2, 4, 3),
+                    new ModelPrice("claude-opus-5", "2026-08-12", 2, 4, 8, 6)
+                }));
+                var priced = UsageAnalyticsCalculator.Calculate(second.History, new UsageFilter(), PricingStore.Load(pricingPath));
+                Check(priced.Spend.Total.KnownUsd == 0.0006M, "saved effective prices calculate archived spend", output);
+                Check(priced.Spend.Total.UnpricedTokens == 10 && priced.Spend.Total.IsPartial,
+                    "unconfigured model makes spend explicitly partial", output);
+                Check(priced.Spend.CacheWrite.KnownUsd == 0.00032M, "cache creation uses cache write pricing", output);
+
                 var evaluation = UsageAlertEvaluator.Evaluate(
                     new AlertSettings { Enabled = true, DailyLimitTokens = 100, WarnPercent = 50 },
                     "2026-08-12",

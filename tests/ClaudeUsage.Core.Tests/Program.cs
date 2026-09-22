@@ -40,6 +40,12 @@ internal static class Program
             ("archive never shrinks", ArchiveNeverShrinks),
             ("analytics filter dates and models", AnalyticsFilters),
             ("analytics summarise a range", AnalyticsSummarise),
+            ("pricing calculates all four categories precisely", PricingCalculatesCategories),
+            ("pricing selects inclusive effective dates", PricingEffectiveDates),
+            ("pricing preserves coverage through filters and totals", PricingFiltersAndCoverage),
+            ("pricing validates identifiers, dates and rates", PricingValidates),
+            ("pricing persists independently of culture", PricingPersists),
+            ("pricing recalculates archived history", PricingRecalculatesArchive),
             ("alerts fire once per level per day", AlertsFireOncePerLevel),
             ("pdf report is structurally valid", PdfIsValid),
             ("pdf report paginates and tolerates empty input", PdfPaginates)
@@ -64,7 +70,7 @@ internal static class Program
             return 1;
         }
 
-        Console.WriteLine("PASS: " + _assertions + " assertions across 17 tests");
+        Console.WriteLine("PASS: " + _assertions + " assertions across 23 tests");
         return 0;
     }
 
@@ -452,6 +458,176 @@ internal static class Program
         Equal("claude-opus-5", analytics.Models[0].ModelId, "largest model first");
         Equal(0L, UsageAnalyticsCalculator.Calculate(UsageHistory.Empty, new UsageFilter())
             .AveragePerActiveDay(TokenMetric.Processed), "no divide by zero on empty history");
+    }
+
+    // ------------------------------------------------------------------ pricing
+
+    private static PricingCatalog TestPricing()
+    {
+        // Deliberately out of order: ordering is by effective date, not entry order.
+        return new PricingCatalog(new[]
+        {
+            new ModelPrice("alpha", "2026-08-04", 100, 200, 400, 300),
+            new ModelPrice("alpha", null, 1, 2, 4, 3),
+            new ModelPrice("alpha", "2026-08-02", 10, 20, 40, 30)
+        });
+    }
+
+    private static UsageHistory PricingHistory()
+    {
+        return new UsageHistory(new UsageDay[]
+        {
+            new SampleDay("2026-08-01", "alpha", 1000000, 2000000, 3000000, 4000000, 1, 0, 1, 1)
+                .WithExtraModel("beta", 1000000, 0, 0, 0, 1, 0),
+            new SampleDay("2026-08-02", "alpha", 1000000, 2000000, 3000000, 4000000, 1, 0, 1, 1),
+            new SampleDay("2026-08-03", "alpha", 1000000, 2000000, 3000000, 4000000, 1, 0, 1, 1)
+        });
+    }
+
+    private static void PricingCalculatesCategories()
+    {
+        var cost = TestPricing().Calculate("alpha", "2026-08-01", new TokenTotals(1000000, 2000000, 3000000, 4000000));
+        Equal(1M, cost.Input.KnownUsd, "input per million");
+        Equal(4M, cost.Output.KnownUsd, "output per million");
+        Equal(9M, cost.CacheRead.KnownUsd, "cache read rate");
+        Equal(16M, cost.CacheWrite.KnownUsd, "cache creation uses cache write rate");
+        Equal(5M, cost.InputOutput.KnownUsd, "input plus output spend");
+        Equal(30M, cost.Total.KnownUsd, "total spend");
+        Equal(10000000L, cost.Total.PricedTokens, "coverage");
+        var tiny = new PricingCatalog(new[] { new ModelPrice("alpha", null, 0.000001M, 0, 0, 0) });
+        Equal(0.000000000001M, tiny.Calculate("alpha", "2026-08-01", new TokenTotals(1, 0, 0, 0)).Total.KnownUsd,
+            "small prices retain decimal precision before presentation");
+        var huge = new PricingCatalog(new[] { new ModelPrice("alpha", null, 1000000, 1000000, 1000000, 1000000) });
+        Equal((decimal)long.MaxValue * 4, huge.Calculate("alpha", "2026-08-01",
+            new TokenTotals(long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue)).Total.KnownUsd,
+            "large counters do not overflow money calculation");
+        Equal(0M, PricingCatalog.Empty.Calculate("missing", "2026-08-01", TokenTotals.Zero).Total.KnownUsd, "no usage has zero cost");
+    }
+
+    private static void PricingEffectiveDates()
+    {
+        var catalog = TestPricing();
+        Equal(1M, catalog.Find("alpha", "2020-01-01").Input, "baseline covers historical usage");
+        Equal(10M, catalog.Find("alpha", "2026-08-02").Input, "effective date is inclusive");
+        Equal(10M, catalog.Find("alpha", "2026-08-03").Input, "rate continues until the next change");
+        Equal(100M, catalog.Find("alpha", "2026-08-04").Input, "later change takes precedence");
+        var datedOnly = new PricingCatalog(catalog.Prices.Where(value => value.EffectiveDate != null));
+        True(datedOnly.Find("alpha", "2026-08-01") == null, "no backfill before first dated rate");
+        True(catalog.Find("Alpha", "2026-08-01") == null, "model identifiers match exactly");
+        var tokens = new TokenTotals(1, 2, 3, 4);
+        var missing = datedOnly.Calculate("alpha", "2026-08-01", tokens);
+        Equal(10L, missing.Total.UnpricedTokens, "unpriced before effective date");
+        Equal(0L, missing.Total.PricedTokens, "unpriced tokens do not become free");
+        var zero = new PricingCatalog(new[] { new ModelPrice("alpha", null, 0, 0, 0, 0) }).Calculate("alpha", "2026-08-01", tokens);
+        Equal(0M, zero.Total.KnownUsd, "explicit free pricing");
+        Equal(10L, zero.Total.PricedTokens, "free is still priced");
+    }
+
+    private static void PricingFiltersAndCoverage()
+    {
+        var history = PricingHistory();
+        var all = UsageAnalyticsCalculator.Calculate(history, new UsageFilter(), TestPricing());
+        Equal(630M, all.Spend.Total.KnownUsd, "prices selected per day before aggregation");
+        Equal(1000000L, all.Spend.Total.UnpricedTokens, "missing model retained in coverage");
+        True(all.Spend.Total.IsPartial, "mixed total is explicitly partial");
+        True(all.Spend.Input.IsPartial, "category coverage is independent");
+        True(!all.Spend.Output.IsPartial, "unused unpriced category does not contaminate coverage");
+        Equal(30M, all.Days[0].Spend.Total.KnownUsd, "daily spend before change");
+        Equal(300M, all.Days[1].Spend.Total.KnownUsd, "daily spend on change date");
+        Equal(630M, all.Models.Single(value => value.ModelId == "alpha").Spend.Total.KnownUsd, "model span includes all rates");
+        Equal(all.Spend.Total.KnownUsd, all.Days.Sum(value => value.Spend.Total.KnownUsd), "daily sum reconciles");
+        Equal(all.Spend.Total.KnownUsd, all.Models.Sum(value => value.Spend.Total.KnownUsd), "model sum reconciles");
+        var filtered = UsageAnalyticsCalculator.Calculate(history, new UsageFilter("2026-08-01", "2026-08-02", new[] { "alpha" }), TestPricing());
+        Equal(330M, filtered.Spend.Total.KnownUsd, "range and model filter both apply to spend");
+        Equal(0L, filtered.Spend.Total.UnpricedTokens, "excluded model cannot contaminate coverage");
+        var empty = UsageAnalyticsCalculator.Calculate(history, new UsageFilter(null, null, new[] { "unknown" }), TestPricing());
+        Equal(0M, empty.Spend.Total.KnownUsd, "empty filter spend");
+        Equal(0L, empty.Spend.Total.UnpricedTokens, "empty filter coverage");
+        var unpriced = UsageAnalyticsCalculator.Calculate(history, new UsageFilter());
+        Equal(31000000L, unpriced.Spend.Total.UnpricedTokens, "no configuration marks all usage unpriced");
+        Equal(31000000L, all.Tokens.ProcessedTokens, "pricing never changes token counts");
+    }
+
+    private static void PricingValidates()
+    {
+        Throws<ArgumentException>(() => new ModelPrice(" ", null, 1, 1, 1, 1), "empty model rejected");
+        Throws<ArgumentException>(() => new ModelPrice("a\nb", null, 1, 1, 1, 1), "control characters rejected");
+        Throws<ArgumentException>(() => new ModelPrice("a", "2026-02-29", 1, 1, 1, 1), "invalid date rejected");
+        Throws<ArgumentException>(() => new ModelPrice("a", null, -1, 1, 1, 1), "negative rate rejected");
+        Throws<ArgumentException>(() => new ModelPrice("a", null, 1, 1, 1000001, 1), "excessive rate rejected");
+        Throws<ArgumentException>(() => new ModelPrice("a", null, 1, 1, 1, 0.0000001M), "precision limit explicit");
+        Throws<ArgumentException>(() => new PricingCatalog(new[]
+        {
+            new ModelPrice("a", null, 1, 1, 1, 1), new ModelPrice(" a ", "", 2, 2, 2, 2)
+        }), "duplicate baseline rejected after identifier normalization");
+        Throws<ArgumentException>(() => new PricingCatalog(new[]
+        {
+            new ModelPrice("a", "2026-08-01", 1, 1, 1, 1), new ModelPrice("a", "2026-08-01", 2, 2, 2, 2)
+        }), "duplicate date rejected");
+        Equal("manual-model-id", new ModelPrice(" manual-model-id ", null, 1, 1, 1, 1).ModelId, "manual model accepted");
+    }
+
+    private static void PricingPersists()
+    {
+        using (var tree = new Scratch())
+        {
+            var path = Path.Combine(tree.Root, "settings", "pricing.xml");
+            Equal(0, PricingStore.Load(path).Prices.Count, "first run has no configured models");
+            var culture = CultureInfo.CurrentCulture;
+            try
+            {
+                CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("fr-FR");
+                var catalog = new PricingCatalog(TestPricing().Prices.Concat(new[]
+                {
+                    new ModelPrice("manual<&>é", null, 1.234567M, 0, 2.3M, 0.01M)
+                }));
+                PricingStore.Save(path, catalog);
+                var reloaded = PricingStore.Load(path);
+                Equal(4, reloaded.Prices.Count, "all pricing periods persisted");
+                Equal(1.234567M, reloaded.Find("manual<&>é", "2026-08-01").Input, "culture and escaped model round trip");
+                Equal(10M, reloaded.Find("alpha", "2026-08-02").Input, "effective dates persisted");
+                PricingStore.Save(path, new PricingCatalog(new[] { new ModelPrice("alpha", null, 7, 0, 0, 0) }));
+                Equal(7M, PricingStore.Load(path).Find("alpha", "2020-01-01").Input, "existing file replaced with edited rates");
+                PricingStore.Save(path, PricingCatalog.Empty);
+                Equal(0, PricingStore.Load(path).Prices.Count, "deletion persists");
+                File.WriteAllText(path, "<pricing schema=\"9\" />");
+                Throws<FormatException>(() => PricingStore.Load(path), "unsupported file reported");
+                Equal("<pricing schema=\"9\" />", File.ReadAllText(path), "failed load preserves file");
+                File.WriteAllText(path, "<pricing schema=\"1\" currency=\"USD\" unit=\"1000000\"><price model=\"a\" /></pricing>");
+                Throws<FormatException>(() => PricingStore.Load(path), "missing rates cannot silently become free");
+                File.WriteAllText(path, "<!DOCTYPE pricing SYSTEM \"https://example.invalid/pricing.dtd\"><pricing />");
+                Throws<System.Xml.XmlException>(() => PricingStore.Load(path), "external DTD prohibited");
+                Throws<IOException>(() => PricingStore.Save(tree.Root, TestPricing()), "save failure reported to caller");
+            }
+            finally { CultureInfo.CurrentCulture = culture; }
+        }
+    }
+
+    private static void PricingRecalculatesArchive()
+    {
+        using (var tree = new Scratch())
+        {
+            tree.WriteTranscript("alpha", "session", new[]
+            {
+                Assistant("2026-08-01T04:00:00Z", "msg_p", "req_p", "alpha", 1000000, 0, 0, 0, "text")
+            });
+            var store = new UsageStore(Path.Combine(tree.Root, "archive.json"));
+            store.Load(MinusFive);
+            store.Refresh(new[] { tree.DataRoot }, MinusFive, CancellationToken.None);
+            True(store.Save(), "priced fixture archive saved");
+            tree.DeleteTranscript("alpha", "session");
+            var reopened = new UsageStore(Path.Combine(tree.Root, "archive.json"));
+            reopened.Load(MinusFive);
+            var history = reopened.Refresh(new[] { tree.DataRoot }, MinusFive, CancellationToken.None).History;
+            var dated = new PricingCatalog(new[] { new ModelPrice("alpha", "2026-08-01", 8, 0, 0, 0) });
+            var first = UsageAnalyticsCalculator.Calculate(history, new UsageFilter(), dated);
+            Equal("2026-07-31", first.Days[0].Date, "effective prices follow archived local day, not UTC");
+            Equal(1000000L, first.Spend.Total.UnpricedTokens, "future rate does not backfill history");
+            var baseline = new PricingCatalog(new[] { new ModelPrice("alpha", null, 4, 0, 0, 0) });
+            Equal(4M, UsageAnalyticsCalculator.Calculate(history, new UsageFilter(), baseline).Spend.Total.KnownUsd,
+                "undated edit recalculates after transcript cleanup");
+            Equal(1000000L, history.FindDay("2026-07-31").Tokens.InputTokens, "recorded usage is unchanged");
+        }
     }
 
     // ------------------------------------------------------------------ alerts

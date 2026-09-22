@@ -6,12 +6,14 @@ runs entirely offline, and installs for one Windows user without administrator r
 
 - Current-day and historical token totals, split into input, output, cache read, and cache creation
 - Any date or date range, with an optional per-model filter
+- Configurable model prices in USD per million tokens, with optional effective dates
+- Estimated spend beside token counts in Today, History, and Models
 - A formatted PDF usage report
 - An optional daily token threshold with an early warning
 - Automatic discovery of Claude Code's data folder, with manual override
 
-It reports tokens, not spend, and it is not a billing statement or a view of your remaining plan
-allowance.
+It reports recorded tokens and estimated spend based on your configured rates. It is not a billing
+statement or a view of your remaining plan allowance.
 
 ## Where the numbers come from
 
@@ -74,6 +76,39 @@ area when the window is minimised or closed.
 Choose whether the threshold counts processed tokens (all four categories) or input + output only.
 Cache-read tokens dominate processed totals, so the two scales are very different.
 
+## Model pricing and estimated spend
+
+Open **Pricing…** beside Auto-refresh. The list shows configured models and their current rates.
+**Add model…** accepts a discovered model or an exact model identifier typed manually. **Edit model…**
+opens its pricing periods; **Delete model** removes all of its rates without removing token history.
+Enter prices in **USD per 1,000,000 tokens** for input, output, cache write, and cache read.
+Cache write corresponds to the transcript's cache creation token counter. Rates support six decimal
+places; zero explicitly means free. No provider prices are prefilled or fetched.
+
+An unchecked effective date sets the model's **historical baseline**. A dated period applies from
+that local calendar day (inclusive) until the next dated period. Use **Add period** to keep older
+rates when introducing a new one. Editing the baseline recalculates earlier history, while dated
+periods continue to override it. Without a baseline, usage before the first dated rate is unpriced.
+Only one period per model may use a given date, and only one may be undated.
+
+**Save model** updates the draft model list; **Save** on the pricing screen persists the complete
+configuration. Cancel discards that screen's edits. Prices are stored per user in
+`%LOCALAPPDATA%\ClaudeUsage\pricing.xml`, independently of the token archive. A failed save is
+reported and leaves the draft open. Spend recalculates immediately on Save, including archived
+history whose transcripts have been cleaned up.
+
+Spend appears below the existing token count in each summary card and category cell. Table columns
+still sort by token count. History and Models use the same date and model filters for both measures.
+**Not configured** means the category's usage has no applicable price; **(partial)** means only some
+of its tokens are priced, and the displayed amount is the known subtotal. Hover to see exact spend
+and priced/unpriced token counts. A category with no tokens has zero spend. Amounts below one cent
+show extra decimal places; calculations retain decimal precision before display rounding.
+
+The app displays a persistent disclaimer: “Claudeometer provides estimates based on the CLI's
+session data and your configured prices. Actual spend is only available from Gemini Enterprise
+Agent Platform.” This deployment accesses Anthropic models through that platform's Model Garden;
+Claude Code session transcripts remain the local usage source.
+
 ## PDF export
 
 **Export PDF…** (or Ctrl+E) writes the current date range and model filter to a paginated report:
@@ -92,7 +127,7 @@ dotnet run --project tests/ClaudeUsage.Core.Tests/ClaudeUsage.Core.Tests.csproj 
 ```
 
 `ClaudeUsage.exe --self-test` exercises the shipped binary end to end: scan, archive durability,
-range filtering, threshold evaluation, and PDF structure. The GitHub Actions workflow performs the
+range filtering, pricing persistence and estimates, threshold evaluation, and PDF structure. The GitHub Actions workflow performs the
 authoritative Windows build, runs both, and uploads the ZIP. A non-Windows machine can compile
 against .NET Framework reference assemblies; `src/ClaudeUsage.Core` targets `netstandard2.0` and the
 application targets `net48`, which Windows 11 already includes.

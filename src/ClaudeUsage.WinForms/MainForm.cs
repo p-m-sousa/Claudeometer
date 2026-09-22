@@ -26,6 +26,10 @@ namespace ClaudeUsage.WinForms
         private readonly System.Windows.Forms.Timer _watchDebounce = new System.Windows.Forms.Timer();
         private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
 
+        private PricingCatalog _pricing = PricingCatalog.Empty;
+        private string _pricingLoadError;
+        private static string PricingPath { get { return Path.Combine(AppSettings.DataDirectory, "pricing.xml"); } }
+
         private UsageHistory _history = UsageHistory.Empty;
         private ScanReport _report;
         private UsageAnalytics _rangeAnalytics;
@@ -64,6 +68,8 @@ namespace ClaudeUsage.WinForms
         internal MainForm(IEnumerable<string> commandLineSources)
         {
             _settings = new AppSettings();
+            try { _pricing = PricingStore.Load(PricingPath); }
+            catch (Exception error) { _pricingLoadError = error.Message; }
             if (commandLineSources != null)
             {
                 var provided = commandLineSources
@@ -85,6 +91,10 @@ namespace ClaudeUsage.WinForms
 
             Shown += async (sender, args) =>
             {
+                if (_pricingLoadError != null)
+                    MessageBox.Show(this, "Saved pricing could not be loaded. Spend will show as unpriced. " +
+                        "The pricing file has been left unchanged. " + _pricingLoadError, "Model pricing",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 await Task.Run(() => _store.Load(TimeZoneInfo.Local));
                 SetupWatchers();
                 await RefreshAsync(false);
@@ -119,12 +129,13 @@ namespace ClaudeUsage.WinForms
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 3,
+                RowCount = 4,
                 BackColor = Palette.Window,
                 Padding = new Padding(18, 14, 18, 0)
             };
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             Controls.Add(root);
             root.Controls.Add(BuildHeader(), 0, 0);
@@ -159,7 +170,15 @@ namespace ClaudeUsage.WinForms
             };
             status.Items.Add(_statusLabel);
             status.Items.Add(_freshnessLabel);
-            root.Controls.Add(status, 0, 2);
+            var disclaimer = new Label
+            {
+                Text = "Claudeometer provides estimates based on the CLI's session data and your configured prices. " +
+                    "Actual spend is only available from Gemini Enterprise Agent Platform.",
+                AutoSize = true, Dock = DockStyle.Fill, ForeColor = Palette.Muted,
+                Margin = new Padding(0, 2, 0, 6), AccessibleName = "Spend estimates disclaimer"
+            };
+            root.Controls.Add(disclaimer, 0, 2);
+            root.Controls.Add(status, 0, 3);
         }
 
         private Control BuildHeader()
@@ -235,6 +254,9 @@ namespace ClaudeUsage.WinForms
                 Anchor = AnchorStyles.Right,
                 Margin = new Padding(8, 0, 0, 0)
             };
+            var pricingButton = HeaderButton("Pricing…", "Configure model prices in USD per million tokens");
+            pricingButton.Click += (sender, args) => EditPricing();
+            intervalPanel.Controls.Add(pricingButton);
             intervalPanel.Controls.Add(new Label
             {
                 Text = "Auto-refresh",
@@ -293,7 +315,7 @@ namespace ClaudeUsage.WinForms
             AddNumberColumn(_todayModelsGrid, "Input");
             AddNumberColumn(_todayModelsGrid, "Output");
             AddNumberColumn(_todayModelsGrid, "Cache read");
-            AddNumberColumn(_todayModelsGrid, "Cache creation");
+            AddNumberColumn(_todayModelsGrid, "Cache write");
             AddNumberColumn(_todayModelsGrid, "Processed");
             AddNumberColumn(_todayModelsGrid, "Responses");
             _todayModelsGrid.Height = 210;
@@ -323,7 +345,7 @@ namespace ClaudeUsage.WinForms
             AddNumberColumn(_dailyGrid, "Input");
             AddNumberColumn(_dailyGrid, "Output");
             AddNumberColumn(_dailyGrid, "Cache read");
-            AddNumberColumn(_dailyGrid, "Cache creation");
+            AddNumberColumn(_dailyGrid, "Cache write");
             AddNumberColumn(_dailyGrid, "Processed");
             AddNumberColumn(_dailyGrid, "Responses");
             AddNumberColumn(_dailyGrid, "Tool calls");
@@ -348,7 +370,7 @@ namespace ClaudeUsage.WinForms
             AddNumberColumn(_modelsGrid, "Input");
             AddNumberColumn(_modelsGrid, "Output");
             AddNumberColumn(_modelsGrid, "Cache read");
-            AddNumberColumn(_modelsGrid, "Cache creation");
+            AddNumberColumn(_modelsGrid, "Cache write");
             AddNumberColumn(_modelsGrid, "Processed");
             AddNumberColumn(_modelsGrid, "Responses");
             AddNumberColumn(_modelsGrid, "Tool calls");
@@ -376,7 +398,7 @@ namespace ClaudeUsage.WinForms
             cards.Controls.Add(CreateCard("Input", "input", target, Palette.Blue), 1, 0);
             cards.Controls.Add(CreateCard("Output", "output", target, Palette.Green), 2, 0);
             cards.Controls.Add(CreateCard("Cache read", "cacheRead", target, Palette.Purple), 0, 1);
-            cards.Controls.Add(CreateCard("Cache creation", "cacheCreate", target, Palette.Orange), 1, 1);
+            cards.Controls.Add(CreateCard("Cache write", "cacheCreate", target, Palette.Orange), 1, 1);
             cards.Controls.Add(CreateCard("Input + output", "io", target, Palette.Teal), 2, 1);
             return cards;
         }
@@ -764,6 +786,7 @@ namespace ClaudeUsage.WinForms
             var today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             var day = _history.FindDay(today);
             var tokens = day == null ? TokenTotals.Zero : day.Tokens;
+            var todayAnalytics = UsageAnalyticsCalculator.Calculate(_history, new UsageFilter(today, today, null), _pricing);
 
             _todayHeading.Text = "Today - " + DateTime.Now.ToString("dddd, d MMMM yyyy", CultureInfo.CurrentCulture);
             SetCard(_todayCards, "processed", tokens.ProcessedTokens);
@@ -772,6 +795,7 @@ namespace ClaudeUsage.WinForms
             SetCard(_todayCards, "cacheRead", tokens.CacheReadTokens);
             SetCard(_todayCards, "cacheCreate", tokens.CacheCreationTokens);
             SetCard(_todayCards, "io", tokens.InputOutputTokens);
+            SetSpendCards(_todayCards, todayAnalytics.Spend);
 
             _todaySecondary.Text = "Responses " + Exact(day == null ? 0 : day.ResponseCount) +
                                    "   -   Messages " + Exact(day == null ? 0 : day.MessageCount) +
@@ -786,11 +810,9 @@ namespace ClaudeUsage.WinForms
             _todayModelsGrid.Rows.Clear();
             if (day != null)
             {
-                foreach (var model in day.Models.Values
-                    .OrderByDescending(value => value.Tokens.ProcessedTokens)
-                    .ThenBy(value => value.ModelId, StringComparer.Ordinal))
+                foreach (var model in todayAnalytics.Models)
                 {
-                    _todayModelsGrid.Rows.Add(
+                    var row = _todayModelsGrid.Rows.Add(
                         model.ModelId,
                         model.Tokens.InputTokens,
                         model.Tokens.OutputTokens,
@@ -798,8 +820,10 @@ namespace ClaudeUsage.WinForms
                         model.Tokens.CacheCreationTokens,
                         model.Tokens.ProcessedTokens,
                         model.ResponseCount);
+                    SetRowSpend(_todayModelsGrid.Rows[row], model.Spend);
                 }
             }
+            _todayNotice.Text += SpendNotice;
 
             RenderThreshold(tokens);
         }
@@ -975,7 +999,7 @@ namespace ClaudeUsage.WinForms
             try
             {
                 var filter = CurrentFilter();
-                _rangeAnalytics = UsageAnalyticsCalculator.Calculate(_history, filter);
+                _rangeAnalytics = UsageAnalyticsCalculator.Calculate(_history, filter, _pricing);
                 var analytics = _rangeAnalytics;
 
                 SetCard(_rangeCards, "processed", analytics.Tokens.ProcessedTokens);
@@ -984,13 +1008,14 @@ namespace ClaudeUsage.WinForms
                 SetCard(_rangeCards, "cacheRead", analytics.Tokens.CacheReadTokens);
                 SetCard(_rangeCards, "cacheCreate", analytics.Tokens.CacheCreationTokens);
                 SetCard(_rangeCards, "io", analytics.Tokens.InputOutputTokens);
+                SetSpendCards(_rangeCards, analytics.Spend);
 
                 RenderChart(analytics);
 
                 _dailyGrid.Rows.Clear();
                 foreach (var day in analytics.Days.OrderByDescending(value => value.Date, StringComparer.Ordinal))
                 {
-                    _dailyGrid.Rows.Add(
+                    var row = _dailyGrid.Rows.Add(
                         day.Date,
                         day.Tokens.InputTokens,
                         day.Tokens.OutputTokens,
@@ -1000,12 +1025,13 @@ namespace ClaudeUsage.WinForms
                         day.ResponseCount,
                         day.ToolCallCount,
                         day.SessionCount);
+                    SetRowSpend(_dailyGrid.Rows[row], day.Spend);
                 }
 
                 _modelsGrid.Rows.Clear();
                 foreach (var model in analytics.Models)
                 {
-                    _modelsGrid.Rows.Add(
+                    var row = _modelsGrid.Rows.Add(
                         model.ModelId,
                         model.Tokens.InputTokens,
                         model.Tokens.OutputTokens,
@@ -1015,11 +1041,12 @@ namespace ClaudeUsage.WinForms
                         model.ResponseCount,
                         model.ToolCallCount,
                         model.WebSearchRequests);
+                    SetRowSpend(_modelsGrid.Rows[row], model.Spend);
                 }
 
-                _rangeNotice.Text = RangeNoticeText(analytics);
+                _rangeNotice.Text = RangeNoticeText(analytics) + SpendNotice;
                 _modelsNotice.Text = "Range " + RangeLabel() + " - " + ModelLabel() +
-                                     ". Message and session counts are not shown here because a session can span models.";
+                                     ". Message and session counts are not shown here because a session can span models." + SpendNotice;
             }
             catch (ArgumentException error)
             {
@@ -1235,6 +1262,18 @@ namespace ClaudeUsage.WinForms
 
                 SetupWatchers();
                 BeginInvoke(new Action(async () => await RefreshAsync(true)));
+            }
+        }
+
+        private void EditPricing()
+        {
+            using (var dialog = new PricingDialog(_pricing, _history.ModelIds,
+                catalog => PricingStore.Save(PricingPath, catalog)))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                _pricing = dialog.Result;
+                RenderToday();
+                RenderRange();
             }
         }
 
@@ -1533,12 +1572,21 @@ namespace ClaudeUsage.WinForms
             };
             card.Controls.Add(value, 0, 2);
             values[key] = value;
+            card.RowCount = 4;
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var spend = new Label
+            {
+                Text = "USD $0.00", AutoSize = true, ForeColor = Palette.Muted,
+                Margin = new Padding(0, 4, 0, 0), AccessibleName = title + " estimated spend"
+            };
+            card.Controls.Add(spend, 0, 3);
+            values[key + ".spend"] = spend;
             return card;
         }
 
         private static DataGridView CreateGrid(string accessibleName)
         {
-            return new DataGridView
+            var grid = new DataGridView
             {
                 Dock = DockStyle.Top,
                 ReadOnly = true,
@@ -1554,10 +1602,21 @@ namespace ClaudeUsage.WinForms
                 GridColor = Palette.Border,
                 EnableHeadersVisualStyles = SystemInformation.HighContrast,
                 ColumnHeadersHeight = 36,
-                RowTemplate = { Height = 30 },
+                RowTemplate = { Height = 52 },
+                AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells,
                 AccessibleName = accessibleName,
                 Margin = new Padding(0, 0, 0, 8)
             };
+            // Keep numeric cell values for numeric sorting; spend is presentation only.
+            grid.CellFormatting += (sender, args) =>
+            {
+                if (args.RowIndex < 0 || args.ColumnIndex < 0) return;
+                var amount = grid.Rows[args.RowIndex].Cells[args.ColumnIndex].Tag as SpendAmount;
+                if (amount == null || !(args.Value is long)) return;
+                args.Value = Exact((long)args.Value) + "\n" + SpendText(amount, false);
+                args.FormattingApplied = true;
+            };
+            return grid;
         }
 
         private static void AddTextColumn(DataGridView grid, string title, int width, DataGridViewAutoSizeColumnMode mode)
@@ -1566,6 +1625,7 @@ namespace ClaudeUsage.WinForms
             {
                 HeaderText = title,
                 Width = width,
+                MinimumWidth = width,
                 AutoSizeMode = mode,
                 SortMode = DataGridViewColumnSortMode.Automatic
             });
@@ -1649,6 +1709,54 @@ namespace ClaudeUsage.WinForms
             label.Text = Compact(value);
             label.AccessibleDescription = Exact(value);
             _toolTip.SetToolTip(label, Exact(value));
+        }
+
+        private const string SpendNotice = " Spend beneath tokens is estimated USD. Partial = some tokens have no price; use Pricing to configure them.";
+
+        private static string SpendText(SpendAmount amount, bool includeCurrency)
+        {
+            if (amount.UnpricedTokens > 0 && amount.PricedTokens == 0) return "Not configured";
+            var value = amount.KnownUsd;
+            var text = value > 0 && value < 0.000001M ? "<$0.000001"
+                : "$" + value.ToString(value > 0 && value < 0.01M ? "0.00####" : "N2", CultureInfo.GetCultureInfo("en-US"));
+            return (includeCurrency ? "USD " : "") + text + (amount.IsPartial ? " (partial)" : "");
+        }
+
+        private static string SpendDetails(SpendAmount amount)
+        {
+            return "Estimated USD " + amount.KnownUsd.ToString("0.####################", CultureInfo.InvariantCulture) +
+                "; " + Exact(amount.PricedTokens) + " priced tokens; " + Exact(amount.UnpricedTokens) +
+                " tokens with pricing not configured.";
+        }
+
+        private void SetSpendCards(IDictionary<string, Label> cards, SpendTotals spend)
+        {
+            SetSpendCard(cards, "processed", spend.Total);
+            SetSpendCard(cards, "input", spend.Input);
+            SetSpendCard(cards, "output", spend.Output);
+            SetSpendCard(cards, "cacheRead", spend.CacheRead);
+            SetSpendCard(cards, "cacheCreate", spend.CacheWrite);
+            SetSpendCard(cards, "io", spend.InputOutput);
+        }
+
+        private void SetSpendCard(IDictionary<string, Label> cards, string key, SpendAmount amount)
+        {
+            var label = cards[key + ".spend"];
+            label.Text = SpendText(amount, true);
+            label.AccessibleDescription = SpendDetails(amount);
+            _toolTip.SetToolTip(label, SpendDetails(amount));
+        }
+
+        private static void SetRowSpend(DataGridViewRow row, SpendTotals spend)
+        {
+            var amounts = new[] { spend.Input, spend.Output, spend.CacheRead, spend.CacheWrite, spend.Total };
+            for (var i = 0; i < amounts.Length; i++)
+            {
+                var cell = row.Cells[i + 1];
+                cell.Tag = amounts[i];
+                cell.Style.WrapMode = DataGridViewTriState.True;
+                cell.ToolTipText = SpendDetails(amounts[i]);
+            }
         }
 
         private static string Compact(long value)
