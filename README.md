@@ -144,8 +144,11 @@ application targets `net48`, which Windows 11 already includes.
 `WINDOWS_TEST_CHECKLIST.md` has the manual Windows verification steps with deterministic expected
 values.
 
-Unsigned local builds may trigger Windows SmartScreen. Production downloads should be
-Authenticode-signed. Signing affects trust prompts, not the app's no-admin design.
+Unsigned local builds may trigger Windows SmartScreen. The release workflow requires timestamped
+Authenticode signatures from the configured publisher before publishing new tagged releases.
+See [SIGNING.md](SIGNING.md) for the Azure identity-validation and repository setup prerequisites.
+Signing helps establish publisher reputation; initial SmartScreen warnings can still occur.
+Installation remains per-user without elevation. Existing releases through v0.2.3 are unsigned.
 
 ## Privacy
 

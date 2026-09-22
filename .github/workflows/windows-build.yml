@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build-test-package:
@@ -18,6 +19,25 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v5
+
+      - name: Check release signing configuration
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          SIGNING_ENDPOINT: ${{ vars.SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT_NAME: ${{ vars.SIGNING_ACCOUNT_NAME }}
+          SIGNING_CERTIFICATE_PROFILE: ${{ vars.SIGNING_CERTIFICATE_PROFILE }}
+          SIGNING_PUBLISHER_SUBJECT: ${{ vars.SIGNING_PUBLISHER_SUBJECT }}
+        run: |
+          $required = @('AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID',
+            'SIGNING_ENDPOINT', 'SIGNING_ACCOUNT_NAME', 'SIGNING_CERTIFICATE_PROFILE', 'SIGNING_PUBLISHER_SUBJECT')
+          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0) {
+            throw "Release signing is not configured. Missing repository variables: $($missing -join ', '). See SIGNING.md."
+          }
 
       - name: Install .NET SDK
         uses: actions/setup-dotnet@v5
@@ -85,6 +105,48 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      - name: Test signed release safeguards
+        shell: pwsh
+        run: ./scripts/test-release-signatures.ps1
+
+      - name: Sign in to Azure for release signing
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign release executable and library
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\src\ClaudeUsage.WinForms\bin\Release\net48
+          files-folder-filter: ClaudeUsage.exe,ClaudeUsage.*.dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify release signatures
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.SIGNING_PUBLISHER_SUBJECT }}
+        run: ./scripts/verify-release-signatures.ps1 -Directory 'src/ClaudeUsage.WinForms/bin/Release/net48' -ExpectedPublisherSubject $env:EXPECTED_PUBLISHER
+
       - name: Run application self-test
         shell: pwsh
         run: |
@@ -101,7 +163,32 @@ jobs:
 
       - name: Package portable release
         shell: pwsh
-        run: ./scripts/package-release.ps1 -NoBuild -Version '${{ steps.version.outputs.value }}'
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          EXPECTED_PUBLISHER: ${{ vars.SIGNING_PUBLISHER_SUBJECT }}
+        run: |
+          $options = @{ NoBuild = $true; Version = $env:RELEASE_VERSION }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $options.RequireSigned = $true
+            $options.ExpectedPublisherSubject = $env:EXPECTED_PUBLISHER
+          }
+          ./scripts/package-release.ps1 @options
+
+      - name: Verify signatures in release ZIP
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          EXPECTED_PUBLISHER: ${{ vars.SIGNING_PUBLISHER_SUBJECT }}
+        run: |
+          $archive = "artifacts/ClaudeUsage-$env:RELEASE_VERSION-win-anycpu.zip"
+          $extracted = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString('N'))
+          try {
+            Expand-Archive -LiteralPath $archive -DestinationPath $extracted
+            ./scripts/verify-release-signatures.ps1 -Directory $extracted -ExpectedPublisherSubject $env:EXPECTED_PUBLISHER
+          } finally {
+            if (Test-Path -LiteralPath $extracted) { Remove-Item -LiteralPath $extracted -Recurse -Force }
+          }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7

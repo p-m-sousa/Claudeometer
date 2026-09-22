@@ -263,6 +263,10 @@ Point the app at a copy of a real `.claude` folder for this section.
 
 ## Installation without administrator rights
 
+- [ ] On a signed release, `Get-AuthenticodeSignature` reports `Valid` for `ClaudeUsage.exe`
+      and `ClaudeUsage.Core.dll`, with the expected publisher and a timestamp certificate.
+      Repeat against the installed copies. Existing releases through v0.2.3 are unsigned.
+
 - [ ] `install.cmd` run as a standard user completes without any UAC prompt.
 - [ ] The app is in `%LOCALAPPDATA%\Programs\ClaudeUsage`; nothing is written to `%ProgramFiles%`,
       `%WINDIR%`, or `HKLM`.

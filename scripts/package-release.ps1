@@ -13,11 +13,19 @@ param(
 
     [switch]$NoBuild,
 
-    [switch]$IncludeSymbols
+    [switch]$IncludeSymbols,
+
+    [switch]$RequireSigned,
+
+    [string]$ExpectedPublisherSubject
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ($RequireSigned -and (-not $NoBuild -or [string]::IsNullOrWhiteSpace($ExpectedPublisherSubject))) {
+    throw 'Signed packaging requires -NoBuild and -ExpectedPublisherSubject. Sign the build output first.'
+}
 
 if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
     throw "Version '$Version' contains characters that are unsafe in an artifact name."
@@ -110,6 +118,10 @@ Copy-Item -LiteralPath (Join-Path $repositoryRoot 'packaging/uninstall.cmd') -De
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'packaging/README-WINDOWS.txt') -Destination (Join-Path $stageDirectory 'README.txt')
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE') -Destination (Join-Path $stageDirectory 'LICENSE.txt')
 Set-Content -LiteralPath (Join-Path $stageDirectory 'VERSION') -Value $Version -Encoding ASCII
+
+if ($RequireSigned) {
+    & "$PSScriptRoot/verify-release-signatures.ps1" -Directory $stageDirectory -ExpectedPublisherSubject $ExpectedPublisherSubject
+}
 
 Compress-Archive -Path (Join-Path $stageDirectory '*') -DestinationPath $archivePath -CompressionLevel Optimal
 $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
