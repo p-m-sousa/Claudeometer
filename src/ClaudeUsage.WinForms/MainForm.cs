@@ -187,14 +187,14 @@ namespace ClaudeUsage.WinForms
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
-                ColumnCount = 6,
+                ColumnCount = 7,
                 RowCount = 2,
                 BackColor = Palette.Window,
                 Margin = new Padding(0)
             };
             header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            for (var index = 0; index < 4; index++) header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            for (var index = 0; index < 5; index++) header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             header.Controls.Add(new Label
             {
@@ -229,9 +229,13 @@ namespace ClaudeUsage.WinForms
             sourcesButton.Click += (sender, args) => EditSources();
             header.Controls.Add(sourcesButton, 4, 0);
 
-            var alertsButton = HeaderButton("Alerts…", "Set a daily token threshold and warning level");
+            var alertsButton = HeaderButton("Alerts…", "Set a daily token or estimated spend threshold and warning level");
             alertsButton.Click += (sender, args) => EditAlerts();
             header.Controls.Add(alertsButton, 5, 0);
+
+            var pricingButton = HeaderButton("Pricing…", "Configure model prices in USD per million tokens");
+            pricingButton.Click += (sender, args) => EditPricing();
+            header.Controls.Add(pricingButton, 6, 0);
 
             _sourceLabel = new Label
             {
@@ -254,9 +258,6 @@ namespace ClaudeUsage.WinForms
                 Anchor = AnchorStyles.Right,
                 Margin = new Padding(8, 0, 0, 0)
             };
-            var pricingButton = HeaderButton("Pricing…", "Configure model prices in USD per million tokens");
-            pricingButton.Click += (sender, args) => EditPricing();
-            intervalPanel.Controls.Add(pricingButton);
             intervalPanel.Controls.Add(new Label
             {
                 Text = "Auto-refresh",
@@ -279,7 +280,7 @@ namespace ClaudeUsage.WinForms
                 new RefreshChoice("Off", 0)
             });
             intervalPanel.Controls.Add(_refreshInterval);
-            header.SetColumnSpan(intervalPanel, 3);
+            header.SetColumnSpan(intervalPanel, 4);
             header.Controls.Add(intervalPanel, 3, 1);
             return header;
         }
@@ -825,10 +826,10 @@ namespace ClaudeUsage.WinForms
             }
             _todayNotice.Text += SpendNotice;
 
-            RenderThreshold(tokens);
+            RenderThreshold(tokens, todayAnalytics.Spend.Total);
         }
 
-        private void RenderThreshold(TokenTotals todayTokens)
+        private void RenderThreshold(TokenTotals todayTokens, SpendAmount todaySpend)
         {
             var alerts = _settings.Alerts;
             if (!alerts.IsActive)
@@ -840,11 +841,10 @@ namespace ClaudeUsage.WinForms
                 return;
             }
 
-            var evaluation = UsageAlertEvaluator.Evaluate(
-                alerts,
-                DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-                todayTokens.Select(alerts.Metric),
-                _settings.NotifiedAlert);
+            var today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            var evaluation = alerts.UseSpend
+                ? UsageAlertEvaluator.EvaluateSpend(alerts, today, todaySpend, _settings.NotifiedAlert)
+                : UsageAlertEvaluator.Evaluate(alerts, today, todayTokens.Select(alerts.Metric), _settings.NotifiedAlert);
 
             _thresholdButton.Text = "Change threshold…";
             _thresholdBar.Visible = true;
@@ -864,7 +864,11 @@ namespace ClaudeUsage.WinForms
             var today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             var day = _history.FindDay(today);
             var tokens = day == null ? 0 : day.Tokens.Select(alerts.Metric);
-            var evaluation = UsageAlertEvaluator.Evaluate(alerts, today, tokens, _settings.NotifiedAlert);
+            var evaluation = alerts.UseSpend
+                ? UsageAlertEvaluator.EvaluateSpend(alerts, today,
+                    UsageAnalyticsCalculator.Calculate(_history, new UsageFilter(today, today, null), _pricing).Spend.Total,
+                    _settings.NotifiedAlert)
+                : UsageAlertEvaluator.Evaluate(alerts, today, tokens, _settings.NotifiedAlert);
             if (!evaluation.ShouldNotify) return;
 
             _settings.RecordNotifiedAlert(today, evaluation.Level);
@@ -1154,7 +1158,7 @@ namespace ClaudeUsage.WinForms
                 var point = series.Points.Add(value);
                 point.AxisLabel = key;
                 point.ToolTip = key + ": " + Exact(value) + " processed tokens";
-                if (_settings.Alerts.IsActive &&
+                if (_settings.Alerts.IsActive && !_settings.Alerts.UseSpend &&
                     _settings.Alerts.Metric == TokenMetric.Processed &&
                     value >= _settings.Alerts.DailyLimitTokens)
                 {
@@ -1215,7 +1219,8 @@ namespace ClaudeUsage.WinForms
                             : TimeZoneInfo.Local.StandardName,
                         DataLocations = _roots.ToList(),
                         Metric = _settings.Alerts.Metric,
-                        DailyThresholdTokens = _settings.Alerts.IsActive ? _settings.Alerts.DailyLimitTokens : 0,
+                        DailyThresholdTokens = _settings.Alerts.IsActive && !_settings.Alerts.UseSpend
+                            ? _settings.Alerts.DailyLimitTokens : 0,
                         ArchivedOnlyDays = _archivedOnlyDays
                     };
                     UsageReportWriter.Write(dialog.FileName, _rangeAnalytics, options);
@@ -1274,6 +1279,7 @@ namespace ClaudeUsage.WinForms
                 _pricing = dialog.Result;
                 RenderToday();
                 RenderRange();
+                EvaluateAlerts();
             }
         }
 

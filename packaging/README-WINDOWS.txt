@@ -5,8 +5,9 @@ An unofficial, read-only utility that tracks how many tokens Claude Code has
 processed on this computer, today and historically. It reads Claude Code's own
 session transcripts, works offline, and refreshes every 30 seconds by default.
 
-It reports tokens, not spend. It does not show your remaining Claude
-subscription limit, weekly quota, or any billing total.
+It reports tokens and estimated spend using your configured model prices.
+It does not show your remaining Claude subscription limit, weekly quota,
+or actual billing total.
 
 INSTALL (NO ADMINISTRATOR RIGHTS)
 ---------------------------------
@@ -83,17 +84,24 @@ line.
 ALERTS
 ------
 
-"Alerts..." sets a daily token threshold and a warning percentage. Each level is
+"Alerts..." sets a daily token or estimated spend (USD) threshold and a warning
+percentage. Each level is
 announced at most once per day in the notification area, and the Today tab shows
 progress against the threshold. Alerts need the app to be running; by default it
 keeps watching from the notification area when the window is minimised or
 closed. Right-click the notification icon to exit.
 
+Choose "Estimated spend (USD, all token categories)" to set a daily dollar limit.
+Spend includes cache costs and uses the rates configured under "Pricing..." in
+the top action row. Missing rates are reported as a known subtotal; only that
+subtotal counts toward the threshold. Saving prices immediately updates alerts.
+
 PDF REPORT
 ----------
 
 "Export PDF..." (or Ctrl+E) saves the selected date range and model filter as a
-paginated report: summary tiles, a per-day chart with the threshold marked,
+paginated report: summary tiles, a per-day token chart with a selected token
+threshold marked,
 totals by model, and a full daily table. No print driver or extra software is
 involved.
 

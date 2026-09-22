@@ -103,6 +103,38 @@ namespace ClaudeUsage.WinForms
                     "an already announced threshold stays quiet",
                     output);
 
+                var preferencesPath = Path.Combine(scratch, "preferences.txt");
+                File.WriteAllText(preferencesPath, "alertEnabled=1\nalertLimit=100\nalertMetric=io\n");
+                var preferences = new AppSettings(preferencesPath);
+                Check(!preferences.Alerts.UseSpend && preferences.Alerts.DailyLimitTokens == 100 &&
+                    preferences.Alerts.Metric == TokenMetric.InputOutput,
+                    "legacy preferences retain token thresholds", output);
+                preferences.ReplaceAlerts(new AlertSettings
+                {
+                    Enabled = true, UseSpend = true, DailyLimitUsd = 0.0006M, WarnPercent = 80,
+                    DailyLimitTokens = 100
+                });
+                var spendEvaluation = UsageAlertEvaluator.EvaluateSpend(preferences.Alerts, "2026-08-12",
+                    priced.Spend.Total, new AlertState());
+                Check(spendEvaluation.Level == AlertLevel.Limit && spendEvaluation.ShouldNotify,
+                    "archived spend triggers dollar threshold", output);
+                Check(spendEvaluation.Message.Contains("known subtotal"), "spend alert reports missing prices", output);
+                preferences.RecordNotifiedAlert("2026-08-12", spendEvaluation.Level);
+                var originalCulture = CultureInfo.CurrentCulture;
+                try
+                {
+                    Thread.CurrentThread.CurrentCulture = CultureInfo.GetCultureInfo("fr-FR");
+                    preferences.Save();
+                    Thread.CurrentThread.CurrentCulture = CultureInfo.GetCultureInfo("en-US");
+                    var restored = new AppSettings(preferencesPath);
+                    Check(restored.Alerts.UseSpend && restored.Alerts.DailyLimitUsd == 0.0006M &&
+                        restored.Alerts.DailyLimitTokens == 100 && restored.Alerts.WarnPercent == 80,
+                        "spend preferences survive restart and culture changes", output);
+                    Check(!UsageAlertEvaluator.EvaluateSpend(restored.Alerts, "2026-08-12", priced.Spend.Total,
+                        restored.NotifiedAlert).ShouldNotify, "spend notification stays quiet after restart", output);
+                }
+                finally { Thread.CurrentThread.CurrentCulture = originalCulture; }
+
                 using (var pdf = new MemoryStream())
                 {
                     UsageReportWriter.Write(

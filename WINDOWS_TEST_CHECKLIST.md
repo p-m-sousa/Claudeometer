@@ -126,8 +126,9 @@ messages 2, sessions 1.
       session data and configured prices, and directs users to Gemini Enterprise Agent Platform
       for actual spend. It wraps without clipping on narrow windows and at larger text sizes.
 
-- [ ] **Pricing…** is visible beside Auto-refresh. It opens a list of configured models, with
-      Add model, Edit model, Delete model, Save, and Cancel controls accessible by keyboard.
+- [ ] **Pricing…** is aligned with Refresh now, Export PDF, Data sources, and Alerts in the top
+      action row, with matching button style and spacing. Auto-refresh remains below. It opens a list
+      of configured models, with Add model, Edit model, Delete model, Save, and Cancel controls accessible by keyboard.
 - [ ] On a fresh profile the list is empty. Token usage remains visible; used categories show
       **Not configured** instead of a zero-dollar estimate.
 - [ ] Add `claude-opus-5` from the discovered-model list with no effective date. Enter synthetic
@@ -174,7 +175,7 @@ messages 2, sessions 1.
 - [ ] Numbers in the PDF match the window exactly for the same range and filter.
 - [ ] Continuation pages repeat the daily table header, and no row is clipped by the footer.
 - [ ] Every page is numbered `Page n of m` with the correct final total.
-- [ ] With a threshold set, the chart shows the threshold line, days at or above it are a different
+- [ ] With a token threshold set, the chart shows the threshold line, days at or above it are a different
       colour, and the summary reports how many days reached it.
 - [ ] The footer names the folders the data came from and states that this is not a bill.
 - [ ] Exporting a range with no data produces a valid one-page-plus report that says so.
@@ -195,6 +196,23 @@ messages 2, sessions 1.
 - [ ] Changing any alert setting re-arms alerts immediately.
 - [ ] Switching the metric to *Input + output* changes today's measured value to 341, and the preview
       text in the dialog updates.
+- [ ] Select **Estimated spend (USD, all token categories)**. The USD field enables and the token
+      field disables; switching back restores the token field and its value. Cancel discards edits.
+- [ ] With both fixture models priced at the undated synthetic rates (input 1, output 2, cache write 4,
+      cache read 3), today's spend is **USD $0.00337**. Set a **0.004** USD threshold and warning at 80%:
+      the preview warns at **USD $0.0032**, Today reads **84%**, and a warning balloon appears once.
+- [ ] Set the USD threshold to **0.003**: Today reads **112%** and a reached balloon appears once.
+      Restart: the mode, precise USD amount, and warning percentage persist, with no repeat balloon.
+- [ ] History's date/model filter does not change today's spend threshold evaluation. Cache read and
+      cache write costs count toward spend even when Input + output was the previous token measure.
+- [ ] Remove Sonnet pricing: Today reports a known subtotal (**USD $0.0033**) and missing prices.
+      With no prices at all, no spend alert fires and the threshold text still explains missing prices.
+- [ ] With USD threshold **0.005**, saving higher applicable pricing that crosses it immediately
+      updates Today and announces the newly reached level. Repeated saves do not repeat that level.
+- [ ] Zero USD disables the selected threshold; values as small as **0.000001** are retained. Verify
+      entry and persistence with a comma-decimal Windows locale, including after a restart.
+- [ ] Selecting a spend threshold does not color the token chart using a previous token threshold,
+      and exported PDFs do not draw that old token threshold. Switching back restores token behavior.
 - [ ] Restarting the app does not re-announce a level already announced today.
 - [ ] With alerts on, minimising hides the window to the notification area; double-clicking the icon
       restores it.

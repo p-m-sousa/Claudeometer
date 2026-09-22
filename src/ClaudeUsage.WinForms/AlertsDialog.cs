@@ -6,14 +6,16 @@ using ClaudeUsage.Core;
 
 namespace ClaudeUsage.WinForms
 {
-    /// <summary>Configures the daily token threshold and the early warning level.</summary>
+    /// <summary>Configures the daily token or estimated spend threshold and the early warning level.</summary>
     internal sealed class AlertsDialog : Form
     {
         private readonly CheckBox _enabled;
         private readonly NumericUpDown _limit;
+        private readonly NumericUpDown _spendLimit;
         private readonly NumericUpDown _warnPercent;
         private readonly RadioButton _processed;
         private readonly RadioButton _inputOutput;
+        private readonly RadioButton _spend;
         private readonly Label _preview;
         private readonly TableLayoutPanel _layout;
 
@@ -42,7 +44,7 @@ namespace ClaudeUsage.WinForms
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 ColumnCount = 2,
-                RowCount = 7,
+                RowCount = 8,
                 Padding = new Padding(16, 14, 16, 12),
                 BackColor = MainForm.Palette.Window
             };
@@ -91,7 +93,22 @@ namespace ClaudeUsage.WinForms
             _limit.ValueChanged += (sender, args) => UpdatePreview();
             layout.Controls.Add(_limit, 1, 1);
 
-            layout.Controls.Add(FieldLabel("Warn at"), 0, 2);
+            layout.Controls.Add(FieldLabel("Daily threshold (USD)"), 0, 2);
+            _spendLimit = new NumericUpDown
+            {
+                Minimum = 0,
+                Maximum = 100000000000M,
+                DecimalPlaces = 6,
+                Increment = 1M,
+                ThousandsSeparator = true,
+                Width = 190,
+                Value = Clamp(settings.DailyLimitUsd),
+                AccessibleName = "Daily estimated spend threshold in USD"
+            };
+            _spendLimit.ValueChanged += (sender, args) => UpdatePreview();
+            layout.Controls.Add(_spendLimit, 1, 2);
+
+            layout.Controls.Add(FieldLabel("Warn at"), 0, 3);
             var warnPanel = new FlowLayoutPanel
             {
                 AutoSize = true,
@@ -117,9 +134,9 @@ namespace ClaudeUsage.WinForms
                 ForeColor = MainForm.Palette.Muted,
                 Margin = new Padding(6, 6, 0, 0)
             });
-            layout.Controls.Add(warnPanel, 1, 2);
+            layout.Controls.Add(warnPanel, 1, 3);
 
-            layout.Controls.Add(FieldLabel("Count"), 0, 3);
+            layout.Controls.Add(FieldLabel("Measure"), 0, 4);
             var metricPanel = new FlowLayoutPanel
             {
                 AutoSize = true,
@@ -131,18 +148,24 @@ namespace ClaudeUsage.WinForms
             {
                 Text = "Processed tokens (input + output + cache read + cache creation)",
                 AutoSize = true,
-                Checked = settings.Metric == TokenMetric.Processed
+                Checked = !settings.UseSpend && settings.Metric == TokenMetric.Processed
             };
-            _processed.CheckedChanged += (sender, args) => UpdatePreview();
             _inputOutput = new RadioButton
             {
                 Text = "Input + output tokens only",
                 AutoSize = true,
-                Checked = settings.Metric == TokenMetric.InputOutput
+                Checked = !settings.UseSpend && settings.Metric == TokenMetric.InputOutput
+            };
+            _spend = new RadioButton
+            {
+                Text = "Estimated spend (USD, all token categories)",
+                AutoSize = true,
+                Checked = settings.UseSpend
             };
             metricPanel.Controls.Add(_processed);
             metricPanel.Controls.Add(_inputOutput);
-            layout.Controls.Add(metricPanel, 1, 3);
+            metricPanel.Controls.Add(_spend);
+            layout.Controls.Add(metricPanel, 1, 4);
 
             _preview = new Label
             {
@@ -157,19 +180,20 @@ namespace ClaudeUsage.WinForms
                 Margin = new Padding(0, 12, 0, 0)
             };
             layout.SetColumnSpan(_preview, 2);
-            layout.Controls.Add(_preview, 0, 4);
+            layout.Controls.Add(_preview, 0, 5);
 
             layout.Controls.Add(new Label
             {
                 Text = "Cache-read tokens dominate processed totals, so a threshold based on them is much larger " +
                        "than one based on input and output alone. Alerts appear in the notification area, so " +
-                       "Claude Usage needs to stay running.",
+                       "Claude Usage needs to stay running. Spend uses your configured Pricing rates, including cache " +
+                       "costs. Missing prices leave a known subtotal; alerts can fire when that subtotal reaches the threshold.",
                 AutoSize = true,
                 MaximumSize = new Size(500, 0),
                 ForeColor = MainForm.Palette.Muted,
                 Margin = new Padding(0, 10, 0, 0)
-            }, 0, 5);
-            layout.SetColumnSpan(layout.GetControlFromPosition(0, 5), 2);
+            }, 0, 6);
+            layout.SetColumnSpan(layout.GetControlFromPosition(0, 6), 2);
 
             var footer = new FlowLayoutPanel
             {
@@ -190,10 +214,13 @@ namespace ClaudeUsage.WinForms
             footer.Controls.Add(cancel);
             footer.Controls.Add(ok);
             layout.SetColumnSpan(footer, 2);
-            layout.Controls.Add(footer, 0, 6);
+            layout.Controls.Add(footer, 0, 7);
             AcceptButton = ok;
             CancelButton = cancel;
 
+            _processed.CheckedChanged += (sender, args) => UpdateEnabledState();
+            _inputOutput.CheckedChanged += (sender, args) => UpdateEnabledState();
+            _spend.CheckedChanged += (sender, args) => UpdateEnabledState();
             UpdateEnabledState();
         }
 
@@ -241,16 +268,18 @@ namespace ClaudeUsage.WinForms
         private void UpdateEnabledState()
         {
             var on = _enabled.Checked;
-            _limit.Enabled = on;
+            _limit.Enabled = on && !_spend.Checked;
+            _spendLimit.Enabled = on && _spend.Checked;
             _warnPercent.Enabled = on;
             _processed.Enabled = on;
             _inputOutput.Enabled = on;
+            _spend.Enabled = on;
             UpdatePreview();
         }
 
         private void UpdatePreview()
         {
-            var limit = (long)_limit.Value;
+            var limit = _spend.Checked ? _spendLimit.Value : _limit.Value;
             if (!_enabled.Checked)
             {
                 _preview.Text = "Alerts are off. Today's usage is still shown on the Today tab.";
@@ -263,10 +292,19 @@ namespace ClaudeUsage.WinForms
                 return;
             }
 
-            var warnAt = (long)Math.Ceiling(limit * ((double)_warnPercent.Value / 100D));
-            _preview.Text = "You will be warned once at " + warnAt.ToString("N0", CultureInfo.CurrentCulture) +
-                            " " + MetricLabel() + ", and again at " + limit.ToString("N0", CultureInfo.CurrentCulture) +
-                            ". Each level is announced at most once per day.";
+            var warnAt = limit * (_warnPercent.Value / 100M);
+            if (_spend.Checked)
+            {
+                _preview.Text = "You will be warned once at " + UsageAlertEvaluator.FormatUsd(warnAt) +
+                    " estimated spend, and again at " + UsageAlertEvaluator.FormatUsd(limit) +
+                    ". Each level is announced at most once per day.";
+            }
+            else
+            {
+                _preview.Text = "You will be warned once at " + Math.Ceiling(warnAt).ToString("N0", CultureInfo.CurrentCulture) +
+                    " " + MetricLabel() + ", and again at " + limit.ToString("N0", CultureInfo.CurrentCulture) +
+                    ". Each level is announced at most once per day.";
+            }
         }
 
         private string MetricLabel()
@@ -278,7 +316,9 @@ namespace ClaudeUsage.WinForms
         {
             Result = new AlertSettings
             {
-                Enabled = _enabled.Checked && _limit.Value > 0,
+                Enabled = _enabled.Checked && (_spend.Checked ? _spendLimit.Value : _limit.Value) > 0,
+                UseSpend = _spend.Checked,
+                DailyLimitUsd = _spendLimit.Value,
                 DailyLimitTokens = (long)_limit.Value,
                 WarnPercent = (int)_warnPercent.Value,
                 Metric = _inputOutput.Checked ? TokenMetric.InputOutput : TokenMetric.Processed
@@ -287,7 +327,7 @@ namespace ClaudeUsage.WinForms
             Close();
         }
 
-        private static decimal Clamp(long value)
+        private static decimal Clamp(decimal value)
         {
             if (value < 0) return 0;
             return value > 100000000000L ? 100000000000M : value;

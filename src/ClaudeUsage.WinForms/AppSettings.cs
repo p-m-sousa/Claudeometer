@@ -103,6 +103,8 @@ namespace ClaudeUsage.WinForms
                 builder.AppendLine("minimizeToTray=" + (MinimizeToTray ? "1" : "0"));
                 builder.AppendLine("alertEnabled=" + (Alerts.Enabled ? "1" : "0"));
                 builder.AppendLine("alertLimit=" + Alerts.DailyLimitTokens.ToString(CultureInfo.InvariantCulture));
+                builder.AppendLine("alertUseSpend=" + (Alerts.UseSpend ? "1" : "0"));
+                builder.AppendLine("alertLimitUsd=" + Alerts.DailyLimitUsd.ToString(CultureInfo.InvariantCulture));
                 builder.AppendLine("alertWarnPercent=" + Alerts.WarnPercent.ToString(CultureInfo.InvariantCulture));
                 builder.AppendLine("alertMetric=" + (Alerts.Metric == TokenMetric.InputOutput ? "io" : "processed"));
                 builder.AppendLine("alertDate=" + (NotifiedAlert.Date ?? string.Empty));
@@ -147,6 +149,8 @@ namespace ClaudeUsage.WinForms
             {
                 Enabled = ReadBool("alertEnabled", false),
                 DailyLimitTokens = ReadLong("alertLimit", 0),
+                UseSpend = ReadBool("alertUseSpend", false),
+                DailyLimitUsd = ReadSpendLimit(),
                 WarnPercent = (int)ReadLong("alertWarnPercent", 80),
                 Metric = string.Equals(ReadString("alertMetric"), "io", StringComparison.OrdinalIgnoreCase)
                     ? TokenMetric.InputOutput
@@ -220,6 +224,14 @@ namespace ClaudeUsage.WinForms
             return long.TryParse(ReadString(key), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed) && parsed >= 0
                 ? parsed
                 : fallback;
+        }
+
+        private decimal ReadSpendLimit()
+        {
+            decimal value;
+            return decimal.TryParse(ReadString("alertLimitUsd"), NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture, out value) && value >= 0 && value <= 100000000000M
+                ? value : 0;
         }
     }
 }

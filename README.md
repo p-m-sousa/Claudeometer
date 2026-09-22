@@ -9,7 +9,7 @@ runs entirely offline, and installs for one Windows user without administrator r
 - Configurable model prices in USD per million tokens, with optional effective dates
 - Estimated spend beside token counts in Today, History, and Models
 - A formatted PDF usage report
-- An optional daily token threshold with an early warning
+- An optional daily token or estimated spend threshold with an early warning
 - Automatic discovery of Claude Code's data folder, with manual override
 
 It reports recorded tokens and estimated spend based on your configured rates. It is not a billing
@@ -68,17 +68,24 @@ than one folder.
 
 ## Alerts
 
-Set a daily token threshold and a warning percentage under **Alerts…**. Each level is announced at
-most once per day through a notification-area balloon, and the Today tab shows progress against the
+Set a daily token or estimated spend (USD) threshold and a warning percentage under **Alerts…**.
+Each level is announced at most once per day through a notification-area balloon, and the Today tab shows progress against the
 threshold. Alerts require the app to be running; by default it keeps watching from the notification
 area when the window is minimised or closed.
 
 Choose whether the threshold counts processed tokens (all four categories) or input + output only.
 Cache-read tokens dominate processed totals, so the two scales are very different.
+Alternatively, choose **Estimated spend (USD, all token categories)** and enter a daily dollar limit
+(up to six decimal places). This uses today's usage across all models and your applicable **Pricing…**
+rates, including cache costs. Missing prices are explicitly reported as a known subtotal; that
+subtotal can trigger an alert, but unpriced usage cannot. Saving pricing changes immediately updates
+progress and checks alerts again. Each level still fires at most once per day, including after restart;
+saving alert settings re-arms it. A zero limit disables alerts for the selected measure.
 
 ## Model pricing and estimated spend
 
-Open **Pricing…** beside Auto-refresh. The list shows configured models and their current rates.
+Open **Pricing…** in the top action row alongside **Refresh now**, **Export PDF…**, and **Alerts…**.
+The list shows configured models and their current rates.
 **Add model…** accepts a discovered model or an exact model identifier typed manually. **Edit model…**
 opens its pricing periods; **Delete model** removes all of its rates without removing token history.
 Enter prices in **USD per 1,000,000 tokens** for input, output, cache write, and cache read.
@@ -112,7 +119,9 @@ Claude Code session transcripts remain the local usage source.
 ## PDF export
 
 **Export PDF…** (or Ctrl+E) writes the current date range and model filter to a paginated report:
-summary tiles, a per-day chart with the threshold marked, totals by model, and a full daily table.
+summary tiles, a per-day token chart with the token threshold marked (when selected), totals by model,
+and a full daily table. Spend thresholds appear in Today and notifications; they are not drawn on
+token charts.
 The PDF is generated in-process — no print driver, no external tool, no package dependency — so it
 works on a locked-down machine.
 
@@ -123,7 +132,7 @@ With a .NET 8 SDK or newer:
 ```powershell
 dotnet build src/ClaudeUsage.WinForms/ClaudeUsage.WinForms.csproj --configuration Release
 dotnet run --project tests/ClaudeUsage.Core.Tests/ClaudeUsage.Core.Tests.csproj --configuration Release
-./scripts/package-release.ps1 -NoBuild -Version 0.2.2
+./scripts/package-release.ps1 -NoBuild -Version 0.2.3
 ```
 
 `ClaudeUsage.exe --self-test` exercises the shipped binary end to end: scan, archive durability,

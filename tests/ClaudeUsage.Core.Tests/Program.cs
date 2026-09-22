@@ -47,6 +47,7 @@ internal static class Program
             ("pricing persists independently of culture", PricingPersists),
             ("pricing recalculates archived history", PricingRecalculatesArchive),
             ("alerts fire once per level per day", AlertsFireOncePerLevel),
+            ("spend alerts use precise estimates and preserve coverage", SpendAlerts),
             ("pdf report is structurally valid", PdfIsValid),
             ("pdf report paginates and tolerates empty input", PdfPaginates)
         })
@@ -70,7 +71,7 @@ internal static class Program
             return 1;
         }
 
-        Console.WriteLine("PASS: " + _assertions + " assertions across 23 tests");
+        Console.WriteLine("PASS: " + _assertions + " assertions across 24 tests");
         return 0;
     }
 
@@ -686,6 +687,77 @@ internal static class Program
         var tokens = new TokenTotals(400, 500, 5000, 5000);
         Equal(900L, tokens.Select(inputOutput.Metric), "input + output metric");
         Equal(10900L, tokens.Select(TokenMetric.Processed), "processed metric");
+    }
+
+    private static void SpendAlerts()
+    {
+        const string date = "2026-08-12";
+        var settings = new AlertSettings
+        {
+            Enabled = true, UseSpend = true, DailyLimitUsd = 0.01M, WarnPercent = 80,
+            DailyLimitTokens = 999999, Metric = TokenMetric.InputOutput
+        };
+        var prices = new PricingCatalog(new[] { new ModelPrice("alpha", null, 1, 2, 4, 3) });
+        SpendAmount Spend(long tokens) => prices.Calculate("alpha", date, new TokenTotals(tokens, 0, 0, 0)).Total;
+        AlertEvaluation Evaluate(SpendAmount spend, AlertState state = null) =>
+            UsageAlertEvaluator.EvaluateSpend(settings, date, spend, state);
+
+        True(settings.IsActive, "USD limit activates independently of token metric");
+        var copy = settings.Clone();
+        True(copy.UseSpend, "cloning preserves spend mode");
+        Equal(0.01M, copy.DailyLimitUsd, "cloning preserves USD precision");
+        Equal(AlertLevel.None, Evaluate(Spend(7999)).Level, "no rounding up to warning");
+        var warning = Evaluate(Spend(8000));
+        Equal(AlertLevel.Warning, warning.Level, "exact USD warning boundary");
+        Equal(80, warning.Percent, "USD percentage");
+        Equal(0.008M, warning.Spend.KnownUsd, "evaluation retains spend");
+        Equal(0.01M, warning.LimitUsd, "evaluation retains dollar limit");
+        True(warning.ShouldNotify, "first USD warning notifies");
+        True(!Evaluate(Spend(9000), new AlertState(date, AlertLevel.Warning)).ShouldNotify, "USD warning stays quiet");
+        Equal(AlertLevel.Warning, Evaluate(Spend(9999)).Level, "no rounding up to limit");
+        True(Evaluate(Spend(10000), new AlertState(date, AlertLevel.Warning)).ShouldNotify, "USD limit escalation notifies");
+        Equal(AlertLevel.Limit, Evaluate(Spend(10000)).Level, "exact dollar limit");
+        Equal(150, Evaluate(Spend(15000)).Percent, "spend over threshold");
+        True(!Evaluate(Spend(15000), new AlertState(date, AlertLevel.Limit)).ShouldNotify, "USD limit remains quiet on refresh");
+        True(UsageAlertEvaluator.EvaluateSpend(settings, "2026-08-13", Spend(8000),
+            new AlertState(date, AlertLevel.Limit)).ShouldNotify, "next local day rearms USD warning");
+
+        var unpriced = PricingCatalog.Empty.Calculate("missing", date, new TokenTotals(1000, 0, 0, 0)).Total;
+        var missing = Evaluate(unpriced);
+        True(!missing.ShouldNotify, "unconfigured rates do not trigger spend alerts");
+        True(missing.Message.Contains("Prices are missing"), "missing rates are explicit");
+        var partial = Evaluate(Spend(10000).Add(unpriced));
+        True(partial.ShouldNotify, "known subtotal can reach a threshold");
+        True(partial.Message.Contains("known subtotal"), "partial alert states coverage");
+        var cacheOnly = prices.Calculate("alpha", date, new TokenTotals(0, 0, 2000, 1000)).Total;
+        Equal(AlertLevel.Limit, Evaluate(cacheOnly).Level, "spend includes cache even with stored IO metric");
+        var free = new PricingCatalog(new[] { new ModelPrice("free", null, 0, 0, 0, 0) })
+            .Calculate("free", date, new TokenTotals(100000, 0, 0, 0)).Total;
+        True(!Evaluate(free).ShouldNotify, "explicit free rates stay quiet");
+        True(!Evaluate(free).Message.Contains("missing"), "zero prices are configured");
+        True(!Evaluate(SpendAmount.Zero).ShouldNotify, "empty day stays quiet");
+
+        settings.DailyLimitUsd = 0.000001M;
+        Equal(AlertLevel.Limit, Evaluate(Spend(1)).Level, "six-place dollar threshold");
+        Equal(int.MaxValue, Evaluate(Spend(long.MaxValue)).Percent, "large percentage saturates without overflow");
+        settings.WarnPercent = 100;
+        Equal(AlertLevel.Limit, Evaluate(Spend(1)).Level, "100 percent warning goes straight to limit");
+        settings.Enabled = false;
+        True(!Evaluate(Spend(10000)).ShouldNotify, "disabled spend alerts stay quiet");
+        settings.Enabled = true;
+        settings.DailyLimitUsd = 0;
+        True(!settings.IsActive && !Evaluate(Spend(10000)).ShouldNotify, "zero USD limit is inactive despite token limit");
+        settings.DailyLimitUsd = -1;
+        True(!settings.IsActive, "negative USD limit is inactive");
+
+        var culture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("fr-FR");
+            settings.DailyLimitUsd = 0.01M;
+            True(Evaluate(Spend(8000)).Message.Contains("USD $0.008"), "USD wording is culture-independent and precise");
+        }
+        finally { CultureInfo.CurrentCulture = culture; }
     }
 
     // --------------------------------------------------------------------- pdf

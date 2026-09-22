@@ -21,8 +21,13 @@ namespace ClaudeUsage.Core
 
         public bool Enabled { get; set; }
 
-        /// <summary>Daily token budget. Zero disables evaluation regardless of <see cref="Enabled"/>.</summary>
+        /// <summary>Daily token budget. Zero disables token-based evaluation.</summary>
         public long DailyLimitTokens { get; set; }
+
+        /// <summary>Use estimated USD spend, including all token categories, instead of tokens.</summary>
+        public bool UseSpend { get; set; }
+
+        public decimal DailyLimitUsd { get; set; }
 
         /// <summary>Percentage of the limit that raises the early warning, clamped to 1-100.</summary>
         public int WarnPercent { get; set; }
@@ -31,7 +36,7 @@ namespace ClaudeUsage.Core
 
         public bool IsActive
         {
-            get { return Enabled && DailyLimitTokens > 0; }
+            get { return Enabled && (UseSpend ? DailyLimitUsd > 0 : DailyLimitTokens > 0); }
         }
 
         public int EffectiveWarnPercent
@@ -55,6 +60,8 @@ namespace ClaudeUsage.Core
             {
                 Enabled = Enabled,
                 DailyLimitTokens = DailyLimitTokens,
+                UseSpend = UseSpend,
+                DailyLimitUsd = DailyLimitUsd,
                 WarnPercent = WarnPercent,
                 Metric = Metric
             };
@@ -93,7 +100,9 @@ namespace ClaudeUsage.Core
             long limit,
             int percent,
             string title,
-            string message)
+            string message,
+            SpendAmount spend = null,
+            decimal limitUsd = 0)
         {
             Level = level;
             ShouldNotify = shouldNotify;
@@ -102,6 +111,8 @@ namespace ClaudeUsage.Core
             Percent = percent;
             Title = title;
             Message = message;
+            Spend = spend;
+            LimitUsd = limitUsd;
         }
 
         public AlertLevel Level { get; }
@@ -112,6 +123,11 @@ namespace ClaudeUsage.Core
         public long Tokens { get; }
 
         public long Limit { get; }
+
+        /// <summary>Spend and its coverage for spend evaluations; null for token evaluations.</summary>
+        public SpendAmount Spend { get; }
+
+        public decimal LimitUsd { get; }
 
         /// <summary>Percentage of the daily threshold used, which may exceed 100.</summary>
         public int Percent { get; }
@@ -130,6 +146,7 @@ namespace ClaudeUsage.Core
             AlertState alreadyNotified)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
+            if (settings.UseSpend) throw new ArgumentException("Spend thresholds require a spend estimate.", nameof(settings));
 
             var limit = settings.DailyLimitTokens;
             var percent = limit <= 0 ? 0 : (int)Math.Min(int.MaxValue, (long)Math.Floor(tokensToday * 100D / limit));
@@ -173,6 +190,43 @@ namespace ClaudeUsage.Core
             }
 
             return new AlertEvaluation(level, shouldNotify, tokensToday, limit, percent, title, message);
+        }
+
+        public static AlertEvaluation EvaluateSpend(
+            AlertSettings settings, string date, SpendAmount spendToday, AlertState alreadyNotified)
+        {
+            if (settings == null) throw new ArgumentNullException(nameof(settings));
+            if (spendToday == null) throw new ArgumentNullException(nameof(spendToday));
+            if (!settings.UseSpend) throw new ArgumentException("A spend threshold must be selected.", nameof(settings));
+
+            var limit = settings.DailyLimitUsd;
+            var amount = spendToday.KnownUsd;
+            // Divide before multiplying and cap before converting to handle very small limits.
+            var percent = limit <= 0 ? 0 : amount / (int.MaxValue / 100M) >= limit
+                ? int.MaxValue : (int)decimal.Floor(amount / limit * 100M);
+            var level = AlertLevel.None;
+            if (settings.IsActive)
+            {
+                if (amount >= limit) level = AlertLevel.Limit;
+                else if (amount >= limit * (settings.EffectiveWarnPercent / 100M)) level = AlertLevel.Warning;
+            }
+
+            var previous = alreadyNotified == null ? AlertLevel.None : alreadyNotified.LevelFor(date);
+            var title = level == AlertLevel.Limit ? "Daily estimated spend threshold reached"
+                : level == AlertLevel.Warning ? "Approaching your daily estimated spend threshold" : string.Empty;
+            var message = limit <= 0 ? "No daily spend threshold is set."
+                : "Today's estimated spend is " + FormatUsd(amount) + ", which is " +
+                  percent.ToString(CultureInfo.CurrentCulture) + "% of your " + FormatUsd(limit) + " daily threshold.";
+            if (spendToday.UnpricedTokens > 0)
+                message += " Prices are missing: this is a known subtotal. Configure missing rates in Pricing.";
+
+            return new AlertEvaluation(level, settings.IsActive && level > previous, 0, 0, percent, title, message,
+                spendToday, limit);
+        }
+
+        public static string FormatUsd(decimal value)
+        {
+            return "USD $" + value.ToString("0.00##########################", CultureInfo.InvariantCulture);
         }
 
         private static string Format(long value)
